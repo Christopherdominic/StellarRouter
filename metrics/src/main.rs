@@ -26,11 +26,14 @@
 //! | `router_scrape_errors_total` | Counter | `contract` | Number of failed scrape attempts |
 //! | `router_up` | Gauge | — | 1 if the last scrape cycle succeeded |
 
+mod auth;
 mod cli;
 mod collector;
 mod logging;
 mod metrics;
+mod openapi;
 mod rate_limit;
+mod replay_protection;
 mod rpc;
 mod server;
 mod validation;
