@@ -42,6 +42,8 @@ composable, upgradeable, and access-controlled multi-contract systems on Soroban
 | `router-middleware` | Rate limiting, route enable/disable, and call event logging | 6 |
 | `router-timelock` | Delayed execution queue for sensitive configuration changes | 7 |
 | `router-multicall` | Batch multiple cross-contract calls in one transaction | 6 |
+| `router-execution` | Execution pipeline with simulation, retries, and fee estimation | 8 |
+| `router-quote` | Read-only quote preview contract for expected output, fees, and route details | 4 |
 
 ## Metrics & Monitoring
 
