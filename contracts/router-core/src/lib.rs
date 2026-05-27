@@ -174,7 +174,7 @@ impl RouterCore {
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
 
-        if Self::is_empty_or_whitespace(&name) {
+        if !Self::is_valid_route_name(&name) {
             return Err(RouterError::InvalidRouteName);
         }
 
@@ -935,6 +935,18 @@ impl RouterCore {
         let s = name.to_string();
         s.bytes().all(|b| matches!(b, 9 | 10 | 11 | 12 | 13 | 32))
     }
+
+    /// Returns `true` if `name` passes all route-name constraints:
+    /// - Length ≤ 64 characters
+    /// - Every character is alphanumeric (a-z, A-Z, 0-9), a forward slash `/`,
+    ///   or a hyphen `-`.
+    fn is_valid_route_name(name: &String) -> bool {
+        let s = name.to_string();
+        if s.len() > 64 {
+            return false;
+        }
+        s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'-'))
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1346,6 +1358,43 @@ mod tests {
         let addr = Address::generate(&env);
         let result = client.try_register_route(&admin, &String::from_str(&env, " \t\n\r"), &addr, &None);
         assert_eq!(result, Err(Ok(RouterError::InvalidRouteName)));
+    }
+
+    #[test]
+    fn test_register_name_too_long_fails() {
+        let (env, admin, client) = setup();
+        let addr = Address::generate(&env);
+        // 65 alphanumeric chars — exceeds max length of 64
+        let long_name = String::from_str(&env, &"a".repeat(65));
+        let result = client.try_register_route(&admin, &long_name, &addr, &None);
+        assert_eq!(result, Err(Ok(RouterError::InvalidRouteName)));
+    }
+
+    #[test]
+    fn test_register_name_at_max_length_succeeds() {
+        let (env, admin, client) = setup();
+        let addr = Address::generate(&env);
+        // Exactly 64 chars — must succeed
+        let name = String::from_str(&env, &"a".repeat(64));
+        assert!(client.try_register_route(&admin, &name, &addr, &None).is_ok());
+    }
+
+    #[test]
+    fn test_register_name_with_special_chars_fails() {
+        let (env, admin, client) = setup();
+        let addr = Address::generate(&env);
+        // Underscore is not allowed
+        let result = client.try_register_route(&admin, &String::from_str(&env, "oracle_v1"), &addr, &None);
+        assert_eq!(result, Err(Ok(RouterError::InvalidRouteName)));
+    }
+
+    #[test]
+    fn test_register_name_with_slash_and_hyphen_succeeds() {
+        let (env, admin, client) = setup();
+        let addr = Address::generate(&env);
+        // Slash and hyphen are allowed
+        let name = String::from_str(&env, "oracle/get-price");
+        assert!(client.try_register_route(&admin, &name, &addr, &None).is_ok());
     }
 
     #[test]
