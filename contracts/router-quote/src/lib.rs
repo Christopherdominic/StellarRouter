@@ -63,6 +63,7 @@ use soroban_sdk::{
 #[contracttype]
 pub enum DataKey {
     QuoteTtl, // TTL for quotes in ledger seconds
+    HopCache(Address, Address, Address, i128), // (plugin, token_in, token_out, amount_in) -> HopCacheEntry
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -90,6 +91,13 @@ pub struct HopResult {
     pub amount_in: i128,
     pub amount_out: i128,
     pub fee_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HopCacheEntry {
+    pub amount_out: i128,
+    pub expires_at: u64,
 }
 
 /// Response for a single-hop or multi-hop quote.
@@ -241,6 +249,7 @@ pub enum QuoteError {
 
 // Maximum hops allowed in a multi-hop route. Keeps gas costs bounded.
 const MAX_HOPS: u32 = 5;
+const HOP_CACHE_TTL_SECS: u64 = 5;
 
 }
 
@@ -565,7 +574,13 @@ impl RouterQuote {
         let mut hop_results = Vec::new(env);
 
         for hop in hops.iter() {
-            let gross_amount_out = Self::call_plugin(env, &hop.plugin, &hop.token_in, &hop.token_out, current_amount)?;
+            let gross_amount_out = Self::get_cached_hop_quote(
+                env,
+                &hop.plugin,
+                &hop.token_in,
+                &hop.token_out,
+                current_amount,
+            )?;
 
             // Fee is taken from the input of each hop
             let fee_amount = current_amount * hop.fee_bps as i128 / 10_000;
@@ -627,6 +642,41 @@ impl RouterQuote {
         env.try_invoke_contract::<i128, i128>(plugin, &function, args)
             .map_err(|_| QuoteError::QuoteFailed)?
             .map_err(|_| QuoteError::QuoteFailed)
+    }
+
+    /// Returns a hop quote, using a short-lived per-hop cache when available.
+    fn get_cached_hop_quote(
+        env: &Env,
+        plugin: &Address,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: i128,
+    ) -> Result<i128, QuoteError> {
+        let key = DataKey::HopCache(
+            plugin.clone(),
+            token_in.clone(),
+            token_out.clone(),
+            amount_in,
+        );
+        let now = env.ledger().timestamp();
+
+        if let Some(cached) = env.storage().instance().get::<DataKey, HopCacheEntry>(&key) {
+            if now < cached.expires_at {
+                return Ok(cached.amount_out);
+            }
+            env.storage().instance().remove(&key);
+        }
+
+        let amount_out = Self::call_plugin(env, plugin, token_in, token_out, amount_in)?;
+        env.storage().instance().set(
+            &key,
+            &HopCacheEntry {
+                amount_out,
+                expires_at: now + HOP_CACHE_TTL_SECS,
+            },
+        );
+
+        Ok(amount_out)
     }
     /// Get multiple quotes in a single call (for comparing routes).
     ///

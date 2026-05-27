@@ -52,7 +52,10 @@ pub enum DataKey {
     HasRole(String, Address), // (role, address) -> bool
     RoleAdmin(String),        // role -> Address who manages it
     Blacklisted(Address),
-    RoleMembers(String),   // role -> Vec<Address>
+    RoleMembers(String),   // legacy role -> Vec<Address>
+    RoleMember(String, u32), // (role, index) -> Address
+    RoleMemberIndex(String, Address), // (role, account) -> index
+    RoleMemberCount(String), // role -> total indexed member count
     AddressRoles(Address), // address -> Vec<String>
     RoleExpiry(String, Address),
     BlacklistReason(Address),
@@ -137,18 +140,27 @@ impl RouterAccess {
             .instance()
             .set(&DataKey::HasRole(role.clone(), account.clone()), &true);
 
-        // Add to RoleMembers list (if not already present)
-        let mut members: Vec<Address> = env
+        // Add to indexed member storage (append-only; stale entries filtered at read time)
+        if !env
             .storage()
             .instance()
-            .get(&DataKey::RoleMembers(role.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-        if !members.iter().any(|a| a == account) {
-            members.push_back(account.clone());
+            .has(&DataKey::RoleMemberIndex(role.clone(), account.clone()))
+        {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::RoleMemberCount(role.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::RoleMember(role.clone(), count), &account);
+            env.storage()
+                .instance()
+                .set(&DataKey::RoleMemberIndex(role.clone(), account.clone()), &count);
+            env.storage()
+                .instance()
+                .set(&DataKey::RoleMemberCount(role.clone()), &(count + 1));
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::RoleMembers(role.clone()), &members);
 
         // Add to AddressRoles list (if not already present)
         let mut roles: Vec<String> = env
@@ -206,6 +218,12 @@ impl RouterAccess {
         }
 
         env.storage().instance().remove(&key);
+        env.storage()
+            .instance()
+            .remove(&DataKey::RoleExpiry(role.clone(), target.clone()));
+        env.storage()
+            .instance()
+            .remove(&DataKey::RoleMemberIndex(role.clone(), target.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "role_revoked"),),
@@ -481,18 +499,33 @@ impl RouterAccess {
         true
     }
 
-    pub fn get_role_members(env: Env, role: String) -> Vec<Address> {
-        let all_members: Vec<Address> = env
+    pub fn get_role_members(env: Env, role: String, offset: u32, limit: u32) -> Vec<Address> {
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let total: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::RoleMembers(role.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
+            .get(&DataKey::RoleMemberCount(role.clone()))
+            .unwrap_or(0);
+        if offset >= total {
+            return Vec::new(&env);
+        }
 
-        // Filter out expired roles
+        let end = core::cmp::min(total, offset.saturating_add(limit));
         let mut active_members = Vec::new(&env);
-        for member in all_members.iter() {
-            if Self::has_role_internal(&env, &member, &role) {
-                active_members.push_back(member.clone());
+
+        // Paginate over indexed members and filter out revoked/expired entries.
+        for i in offset..end {
+            if let Some(member) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::RoleMember(role.clone(), i))
+            {
+                if Self::has_role_internal(&env, &role, &member) {
+                    active_members.push_back(member);
+                }
             }
         }
         active_members
@@ -548,6 +581,9 @@ impl RouterAccess {
         env.storage()
             .instance()
             .remove(&DataKey::HasRole(role.clone(), target.clone()));
+        env.storage()
+            .instance()
+            .remove(&DataKey::RoleMemberIndex(role.clone(), target.clone()));
         env.events()
             .publish((Symbol::new(&env, "role_expired"),), (role, target));
         Ok(())
@@ -872,7 +908,7 @@ mod tests {
         let user2 = Address::generate(&env);
 
         // Initially, role should have no members
-        let members_before = client.get_role_members(&role);
+        let members_before = client.get_role_members(&role, &0, &50);
         assert!(members_before.is_empty());
 
         // Grant role to user1
@@ -880,7 +916,7 @@ mod tests {
             .grant_role(&admin, &user1, &role, &None);
 
         // Check that user1 is in role members
-        let members_after_first = client.get_role_members(&role);
+        let members_after_first = client.get_role_members(&role, &0, &50);
         assert_eq!(members_after_first.len(), 1);
         assert!(members_after_first.contains(&user1));
 
@@ -889,7 +925,7 @@ mod tests {
             .grant_role(&admin, &user2, &role, &None);
 
         // Check that both users are in role members
-        let members_after_second = client.get_role_members(&role);
+        let members_after_second = client.get_role_members(&role, &0, &50);
         assert_eq!(members_after_second.len(), 2);
         assert!(members_after_second.contains(&user1));
         assert!(members_after_second.contains(&user2));
@@ -1113,7 +1149,7 @@ mod tests {
         client.grant_role(&admin, &user, &role, &Some(10));
 
         // Verify user is initially in role members
-        let members_before = client.get_role_members(&role);
+        let members_before = client.get_role_members(&role, &0, &50);
         assert!(members_before.contains(&user));
         assert_eq!(members_before.len(), 1);
 
@@ -1124,9 +1160,26 @@ mod tests {
         assert!(!client.has_role(&user, &role));
 
         // get_role_members should not contain the expired user
-        let members_after = client.get_role_members(&role);
+        let members_after = client.get_role_members(&role, &0, &50);
         assert!(!members_after.contains(&user));
         assert!(members_after.is_empty());
+    }
+
+    #[test]
+    fn test_get_role_members_supports_offset_limit_pagination() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let user3 = Address::generate(&env);
+
+        client.grant_role(&admin, &user1, &role, &None);
+        client.grant_role(&admin, &user2, &role, &None);
+        client.grant_role(&admin, &user3, &role, &None);
+
+        let page = client.get_role_members(&role, &1, &1);
+        assert_eq!(page.len(), 1);
+        assert!(page.contains(&user2));
     }
 
     #[test]
