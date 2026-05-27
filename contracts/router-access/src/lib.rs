@@ -190,6 +190,21 @@ impl RouterAccess {
         }
     }
 
+    /// Return the expiry timestamp for a role grant, or None if no expiry is set.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `role` - The role name.
+    /// * `target` - The address whose expiry to query.
+    ///
+    /// # Returns
+    /// `Some(timestamp)` if an expiry exists, `None` otherwise.
+    pub fn get_role_expiry(env: Env, role: String, target: Address) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::RoleExpiry(role, target))
+    }
+
     /// Set the admin for a specific role.
     pub fn set_role_admin(
         env: Env,
@@ -873,5 +888,33 @@ mod tests {
         let target = Address::generate(&env);
         let result = client.try_set_role_admin(&attacker, &role, &target);
         assert_eq!(result, Err(Ok(AccessError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_get_role_expiry_returns_timestamp() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user = Address::generate(&env);
+        let now = env.ledger().timestamp();
+        client.grant_role(&admin, &user, &role, &Some(100));
+        let expiry = client.get_role_expiry(&role, &user);
+        assert_eq!(expiry, Some(now + 100));
+    }
+
+    #[test]
+    fn test_get_role_expiry_none_when_not_granted() {
+        let (env, _admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user = Address::generate(&env);
+        assert_eq!(client.get_role_expiry(&role, &user), None);
+    }
+
+    #[test]
+    fn test_get_role_expiry_max_when_no_expiry() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user = Address::generate(&env);
+        client.grant_role(&admin, &user, &role, &None);
+        assert_eq!(client.get_role_expiry(&role, &user), Some(u64::MAX));
     }
 }
