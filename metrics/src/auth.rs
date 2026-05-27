@@ -40,8 +40,8 @@ impl AuthConfig {
         }
 
         AuthConfig {
-            api_key,
             enabled: enabled && api_key.is_some(),
+            api_key,
         }
     }
 }

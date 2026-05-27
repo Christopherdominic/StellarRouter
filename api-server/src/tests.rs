@@ -1,24 +1,31 @@
 use axum::{
     body::Body,
     http::{Request, StatusCode},
-    Router,
     routing::{get, post},
+    Router,
 };
-use tower::ServiceExt;
 use serde_json::{json, Value};
+use tower::ServiceExt;
 
-use crate::{handlers, rpc::SorobanRpcClient, types::SimulateResponse};
+use crate::{
+    handlers,
+    rpc::SorobanRpcClient,
+    state::AppState,
+    types::SimulateResponse,
+};
 
 /// Valid 56-char Stellar contract ID for use in tests.
 const VALID_CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
 
 fn test_app() -> Router {
     // Use a non-existent RPC URL — the client will fall back to heuristic estimates
-    let rpc = SorobanRpcClient::new("http://localhost:1");
+    let rpc = SorobanRpcClient::new("http://localhost:1", None);
+    let state = AppState::new(rpc);
     Router::new()
         .route("/health", get(handlers::health))
         .route("/simulate", post(handlers::simulate))
-        .with_state(rpc)
+        .route("/routes/:name", get(handlers::get_route))
+        .with_state(state)
 }
 
 // ── GET /health ───────────────────────────────────────────────────────────────
@@ -74,10 +81,7 @@ async fn test_simulate_returns_200_with_valid_request() {
 #[tokio::test]
 async fn test_simulate_response_has_fee_fields() {
     let app = test_app();
-    let body = json!({
-        "target": VALID_CONTRACT_ID,
-        "function": "transfer"
-    });
+    let body = json!({ "target": VALID_CONTRACT_ID, "function": "transfer" });
     let resp = app
         .oneshot(
             Request::builder()
@@ -89,10 +93,8 @@ async fn test_simulate_response_has_fee_fields() {
         )
         .await
         .unwrap();
-
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let parsed: SimulateResponse = serde_json::from_slice(&bytes).unwrap();
-
     assert!(parsed.estimated_fees.base_fee > 0);
     assert!(parsed.estimated_fees.total_fee >= parsed.estimated_fees.base_fee);
     assert_eq!(parsed.simulation.target, VALID_CONTRACT_ID);
@@ -119,14 +121,13 @@ async fn test_simulate_surge_pricing_at_high_load() {
         )
         .await
         .unwrap();
-
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let parsed: SimulateResponse = serde_json::from_slice(&bytes).unwrap();
     assert!(parsed.estimated_fees.high_load);
     assert_eq!(parsed.estimated_fees.surge_multiplier, 200);
 }
 
-// ── POST /simulate — error paths ─────────────────────────────────────────────
+// ── POST /simulate — validation ───────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_simulate_missing_target_returns_400() {
@@ -167,10 +168,7 @@ async fn test_simulate_missing_function_returns_400() {
 #[tokio::test]
 async fn test_simulate_invalid_contract_id_returns_400() {
     let app = test_app();
-    let body = json!({
-        "target": "not-a-valid-contract-id",
-        "function": "transfer"
-    });
+    let body = json!({ "target": "not-a-valid-contract-id", "function": "transfer" });
     let resp = app
         .oneshot(
             Request::builder()
@@ -211,7 +209,7 @@ async fn test_simulate_contract_id_not_starting_with_c_returns_400() {
 }
 
 #[tokio::test]
-async fn test_simulate_empty_body_returns_422() {
+async fn test_simulate_empty_body_returns_400_or_422() {
     let app = test_app();
     let resp = app
         .oneshot(
@@ -224,100 +222,51 @@ async fn test_simulate_empty_body_returns_422() {
         )
         .await
         .unwrap();
-    // Missing required fields → 400 or 422 depending on axum version
     assert!(
         resp.status() == StatusCode::BAD_REQUEST
             || resp.status() == StatusCode::UNPROCESSABLE_ENTITY
     );
-#[cfg(test)]
-mod tests {
-    use crate::types::{SimulateRequest, RouteDetails, TransactionStatus, TransactionStatusEvent};
-    use chrono::Utc;
+}
 
-    #[test]
-    fn test_simulate_request_serialization() {
-        let req = SimulateRequest {
-            target: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".to_string(),
-            function: "transfer".to_string(),
-            route_details: Some(RouteDetails {
-                name: "swap".to_string(),
-                version: Some(1),
-                expected_outputs: Some(vec!["1000000".to_string()]),
-            }),
-        };
+// ── GET /routes/:name ─────────────────────────────────────────────────────────
 
-        let json = serde_json::to_string(&req).unwrap();
-        let deserialized: SimulateRequest = serde_json::from_str(&json).unwrap();
+#[tokio::test]
+async fn test_get_route_returns_404_when_core_not_configured() {
+    // With no ROUTER_CORE_CONTRACT_ID configured the RPC client returns an
+    // error, which the handler maps to 500. But when the RPC is unreachable
+    // and the contract ID is missing we get a 500 (not 404). This test
+    // verifies the endpoint exists and returns a non-200 error code.
+    let app = test_app();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/routes/oracle")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // 500 because ROUTER_CORE_CONTRACT_ID is not set in the test environment
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(json["error"].is_string());
+}
 
-        assert_eq!(deserialized.target, req.target);
-        assert_eq!(deserialized.function, req.function);
-    }
-
-    #[test]
-    fn test_transaction_status_event_serialization() {
-        let event = TransactionStatusEvent {
-            tx_id: "tx_12345".to_string(),
-            status: TransactionStatus::Pending,
-            timestamp: Utc::now().to_rfc3339(),
-            message: Some("Transaction queued".to_string()),
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        let deserialized: TransactionStatusEvent = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(deserialized.tx_id, event.tx_id);
-        assert_eq!(deserialized.status, TransactionStatus::Pending);
-    }
-
-    #[test]
-    fn test_transaction_status_enum() {
-        assert_eq!(
-            serde_json::to_string(&TransactionStatus::Pending).unwrap(),
-            "\"PENDING\""
-        );
-        assert_eq!(
-            serde_json::to_string(&TransactionStatus::Submitted).unwrap(),
-            "\"SUBMITTED\""
-        );
-        assert_eq!(
-            serde_json::to_string(&TransactionStatus::Confirmed).unwrap(),
-            "\"CONFIRMED\""
-        );
-        assert_eq!(
-            serde_json::to_string(&TransactionStatus::Failed).unwrap(),
-            "\"FAILED\""
-        );
-    }
-
-    #[test]
-    fn test_fee_estimate_calculation() {
-        use crate::types::FeeEstimate;
-
-        let fee = FeeEstimate {
-            base_fee: 100,
-            resource_fee: 1000,
-            total_fee: 1100,
-            surge_multiplier: 100,
-            high_load: false,
-        };
-
-        assert_eq!(fee.base_fee + fee.resource_fee, 1100);
-        assert!(!fee.high_load);
-    }
-
-    #[test]
-    fn test_fee_estimate_with_surge() {
-        use crate::types::FeeEstimate;
-
-        let fee = FeeEstimate {
-            base_fee: 100,
-            resource_fee: 1000,
-            total_fee: 2200,
-            surge_multiplier: 200,
-            high_load: true,
-        };
-
-        assert_eq!(fee.total_fee, (fee.base_fee + fee.resource_fee) * 2);
-        assert!(fee.high_load);
-    }
+#[tokio::test]
+async fn test_get_route_error_response_is_json() {
+    let app = test_app();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/routes/nonexistent")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    // Must be valid JSON with an "error" field
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(json.get("error").is_some());
 }

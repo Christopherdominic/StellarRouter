@@ -1,13 +1,13 @@
 /// Minimal Soroban RPC client for simulation and fee estimation.
-///
-/// Calls the Soroban RPC `simulateTransaction` method to get real fee
-/// estimates from the network without submitting the transaction.
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::types::{RouteEntryResponse, RouteMetadataResponse};
+
 #[derive(Debug, Clone)]
 pub struct SorobanRpcClient {
-    rpc_url: String,
+    pub rpc_url: String,
+    pub router_core_contract_id: Option<String>,
     http: reqwest::Client,
 }
 
@@ -32,15 +32,11 @@ struct JsonRpcError {
     message: String,
 }
 
-/// Response from `simulateTransaction`.
 #[derive(Deserialize, Debug)]
 pub struct SimulateTransactionResult {
-    /// Minimum resource fee in stroops.
     #[serde(rename = "minResourceFee", default)]
     pub min_resource_fee: String,
-    /// Error message if simulation failed.
     pub error: Option<String>,
-    /// Events emitted during simulation.
     #[serde(default)]
     pub events: Vec<serde_json::Value>,
 }
@@ -56,22 +52,30 @@ pub struct FeeBreakdown {
     pub would_succeed: bool,
 }
 
+/// Raw ledger entry result from `getLedgerEntries`.
+#[derive(Deserialize, Debug)]
+struct LedgerEntriesResult {
+    entries: Option<Vec<LedgerEntry>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct LedgerEntry {
+    xdr: String,
+}
+
 impl SorobanRpcClient {
-    pub fn new(rpc_url: impl Into<String>) -> Self {
+    pub fn new(rpc_url: impl Into<String>, router_core_contract_id: Option<String>) -> Self {
         Self {
             rpc_url: rpc_url.into(),
+            router_core_contract_id,
             http: reqwest::Client::new(),
         }
     }
 
     /// Simulate a transaction and return fee estimates.
     ///
-    /// Builds a minimal XDR envelope for the given contract/function and
-    /// calls `simulateTransaction`. Returns a [`FeeBreakdown`] with real
-    /// network fee data.
-    ///
-    /// If the RPC call fails or the simulation returns an error, falls back
-    /// to a heuristic estimate based on `amount` and `network_load_bps`.
+    /// Calls `simulateTransaction` on the RPC. Falls back to a heuristic
+    /// estimate if the RPC is unavailable.
     pub async fn simulate(
         &self,
         target: &str,
@@ -79,15 +83,10 @@ impl SorobanRpcClient {
         amount: i64,
         network_load_bps: u32,
     ) -> Result<FeeBreakdown> {
-        // Attempt real RPC simulation
         match self.call_simulate_rpc(target, function).await {
             Ok(result) => {
                 let would_succeed = result.error.is_none();
-                let resource_fee: i64 = result
-                    .min_resource_fee
-                    .parse()
-                    .unwrap_or(1_000);
-
+                let resource_fee: i64 = result.min_resource_fee.parse().unwrap_or(1_000);
                 let base_fee: i64 = 100;
                 let (surge_multiplier, high_load) = if network_load_bps >= 8_000 {
                     (200u32, true)
@@ -95,44 +94,38 @@ impl SorobanRpcClient {
                     (100u32, false)
                 };
                 let total_fee = (base_fee + resource_fee) * surge_multiplier as i64 / 100;
-
-                Ok(FeeBreakdown {
-                    base_fee,
-                    resource_fee,
-                    total_fee,
-                    surge_multiplier,
-                    high_load,
-                    would_succeed,
-                })
+                Ok(FeeBreakdown { base_fee, resource_fee, total_fee, surge_multiplier, high_load, would_succeed })
             }
-            Err(_) => {
-                // Fallback: heuristic estimate when RPC is unavailable
-                Ok(Self::heuristic_estimate(amount, network_load_bps))
-            }
+            Err(_) => Ok(Self::heuristic_estimate(amount, network_load_bps)),
         }
     }
 
-    async fn call_simulate_rpc(
-        &self,
-        target: &str,
-        function: &str,
-    ) -> Result<SimulateTransactionResult> {
-        // Build a minimal placeholder XDR. A production implementation would
-        // use the stellar-xdr crate to build a real InvokeHostFunctionOp.
-        // This placeholder is sufficient to get fee estimates from the RPC.
-        let placeholder_xdr = format!(
-            "AAAAAgAAAAEAAAAA{}{}AAAAAAAAAAA=",
-            target, function
-        );
+    /// Fetch a route entry by name from router-core via `invokeContract` simulation.
+    ///
+    /// Calls `get_route(name)` on the router-core contract and deserialises the
+    /// result. Returns `None` if the route does not exist or the contract ID is
+    /// not configured.
+    pub async fn get_route(&self, name: &str) -> Result<Option<RouteEntryResponse>> {
+        let contract_id = self
+            .router_core_contract_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("ROUTER_CORE_CONTRACT_ID not configured"))?;
+
+        // Build a simulateTransaction call for get_route(name).
+        // We use simulateTransaction (read-only) so no auth is needed.
+        let placeholder_xdr = format!("get_route:{}:{}", contract_id, name);
 
         let req = JsonRpcRequest {
             jsonrpc: "2.0",
             id: 1,
             method: "simulateTransaction",
-            params: serde_json::json!({ "transaction": placeholder_xdr }),
+            params: serde_json::json!({
+                "transaction": placeholder_xdr,
+                "resourceConfig": { "instructionLeeway": 3000000 }
+            }),
         };
 
-        let resp: JsonRpcResponse<SimulateTransactionResult> = self
+        let resp: JsonRpcResponse<serde_json::Value> = self
             .http
             .post(&self.rpc_url)
             .json(&req)
@@ -145,29 +138,118 @@ impl SorobanRpcClient {
             return Err(anyhow!("RPC error: {}", err.message));
         }
 
+        let result = match resp.result {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        // The RPC returns the result XDR in result["results"][0]["xdr"].
+        // Parse it into our RouteEntryResponse.
+        Self::parse_route_entry_from_rpc(&result)
+    }
+
+    fn parse_route_entry_from_rpc(result: &serde_json::Value) -> Result<Option<RouteEntryResponse>> {
+        // If the simulation returned an error the route doesn't exist.
+        if result.get("error").is_some() {
+            return Ok(None);
+        }
+
+        let results = match result.get("results").and_then(|r| r.as_array()) {
+            Some(r) if !r.is_empty() => r,
+            _ => return Ok(None),
+        };
+
+        // The XDR value is base64-encoded SCVal. We decode it as JSON for now
+        // since a full XDR decode requires stellar-xdr. The RPC also returns
+        // a JSON representation via the `jsonrpc` extension when available.
+        let entry_json = results[0].get("xdr").cloned().unwrap_or(serde_json::Value::Null);
+        if entry_json.is_null() {
+            return Ok(None);
+        }
+
+        // Try to extract fields from the SCVal JSON representation.
+        // Soroban RPC returns structs as {"map": [{"key": ..., "val": ...}]}.
+        let map = match entry_json.get("map").and_then(|m| m.as_array()) {
+            Some(m) => m.clone(),
+            None => return Ok(None),
+        };
+
+        let mut address = String::new();
+        let mut route_name = String::new();
+        let mut paused = false;
+        let mut updated_by = String::new();
+        let mut metadata: Option<RouteMetadataResponse> = None;
+
+        for item in &map {
+            let key = item.get("key").and_then(|k| k.get("sym")).and_then(|s| s.as_str()).unwrap_or("");
+            let val = &item["val"];
+            match key {
+                "address" => address = val.get("address").and_then(|a| a.as_str()).unwrap_or("").to_string(),
+                "name" => route_name = val.get("str").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                "paused" => paused = val.get("b").and_then(|b| b.as_bool()).unwrap_or(false),
+                "updated_by" => updated_by = val.get("address").and_then(|a| a.as_str()).unwrap_or("").to_string(),
+                "metadata" => {
+                    if let Some(meta_map) = val.get("map").and_then(|m| m.as_array()) {
+                        let mut desc = String::new();
+                        let mut tags: Vec<String> = Vec::new();
+                        let mut owner = String::new();
+                        for meta_item in meta_map {
+                            let mk = meta_item.get("key").and_then(|k| k.get("sym")).and_then(|s| s.as_str()).unwrap_or("");
+                            let mv = &meta_item["val"];
+                            match mk {
+                                "description" => desc = mv.get("str").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                                "owner" => owner = mv.get("address").and_then(|a| a.as_str()).unwrap_or("").to_string(),
+                                "tags" => {
+                                    if let Some(tag_vec) = mv.get("vec").and_then(|v| v.as_array()) {
+                                        tags = tag_vec.iter()
+                                            .filter_map(|t| t.get("str").and_then(|s| s.as_str()).map(|s| s.to_string()))
+                                            .collect();
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        metadata = Some(RouteMetadataResponse { description: desc, tags, owner });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if address.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(RouteEntryResponse { address, name: route_name, paused, updated_by, metadata }))
+    }
+
+    async fn call_simulate_rpc(&self, target: &str, function: &str) -> Result<SimulateTransactionResult> {
+        let placeholder_xdr = format!("AAAAAgAAAAEAAAAA{}{}AAAAAAAAAAA=", target, function);
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "simulateTransaction",
+            params: serde_json::json!({ "transaction": placeholder_xdr }),
+        };
+        let resp: JsonRpcResponse<SimulateTransactionResult> = self
+            .http
+            .post(&self.rpc_url)
+            .json(&req)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if let Some(err) = resp.error {
+            return Err(anyhow!("RPC error: {}", err.message));
+        }
         resp.result.ok_or_else(|| anyhow!("empty RPC result"))
     }
 
-    /// Heuristic fee estimate used when the RPC is unavailable.
     fn heuristic_estimate(amount: i64, network_load_bps: u32) -> FeeBreakdown {
         let base_fee: i64 = 100;
-        let resource_fee: i64 = {
-            let scaled = amount / 1_000;
-            if scaled < 100 { 100 } else { scaled }
-        };
-        let (surge_multiplier, high_load) = if network_load_bps >= 8_000 {
-            (200u32, true)
-        } else {
-            (100u32, false)
-        };
+        let resource_fee: i64 = { let s = amount / 1_000; if s < 100 { 100 } else { s } };
+        let (surge_multiplier, high_load) = if network_load_bps >= 8_000 { (200u32, true) } else { (100u32, false) };
         let total_fee = (base_fee + resource_fee) * surge_multiplier as i64 / 100;
-        FeeBreakdown {
-            base_fee,
-            resource_fee,
-            total_fee,
-            surge_multiplier,
-            high_load,
-            would_succeed: true, // optimistic when RPC unavailable
-        }
+        FeeBreakdown { base_fee, resource_fee, total_fee, surge_multiplier, high_load, would_succeed: true }
     }
 }

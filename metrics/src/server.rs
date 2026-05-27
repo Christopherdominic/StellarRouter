@@ -17,17 +17,16 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Json, Router,
 };
 use prometheus::{Encoder, Registry, TextEncoder};
 use std::net::SocketAddr;
 use tracing::{info, info_span, Instrument};
-use utoipa_swagger_ui::SwaggerUi;
 
+use crate::auth::AuthConfig;
 use crate::logging::new_request_id;
 use crate::openapi::ApiDoc;
 use crate::rate_limit::{rate_limit_middleware, RateLimiter};
-use crate::auth::AuthConfig;
 use crate::replay_protection::{NonceCache, ReplayProtectionConfig};
 
 /// Shared server state.
@@ -51,7 +50,7 @@ pub async fn serve(listen: String, registry: Registry, limiter: RateLimiter) -> 
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .route("/api-docs/openapi.json", get(openapi_handler))
         .layer(middleware::from_fn_with_state(
             limiter,
             rate_limit_middleware,
@@ -159,19 +158,9 @@ async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// `GET /ready` — readiness probe that checks if the exporter is ready to serve traffic.
-///
-/// Returns 200 OK if the last scrape cycle succeeded (router_up == 1).
-/// Returns 503 Service Unavailable otherwise.
-#[utoipa::path(
-    get,
-    path = "/ready",
-    tag = "health",
-    responses(
-        (status = 200, description = "Exporter is ready to serve traffic"),
-        (status = 503, description = "Exporter is not ready (scrape failed or no contracts configured)"),
-    ),
-)]
+/// `GET /ready` — readiness probe.
+#[utoipa::path(get, path = "/ready", tag = "health",
+    responses((status = 200, description = "Ready"), (status = 503, description = "Not ready")))]
 async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
     // Check if router_up metric is 1
     let metric_families = state.registry.gather();
@@ -194,6 +183,12 @@ async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "not ready")
     }
+}
+
+/// `GET /api-docs/openapi.json` — OpenAPI specification.
+async fn openapi_handler() -> impl IntoResponse {
+    use utoipa::OpenApi;
+    Json(ApiDoc::openapi())
 }
 
 #[cfg(test)]

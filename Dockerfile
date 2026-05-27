@@ -1,17 +1,19 @@
 # syntax=docker/dockerfile:1
 # ── Build stage ───────────────────────────────────────────────────────────────
-FROM rust:1.78-slim AS builder
+FROM rust:1.88-slim AS builder
 
 # Install wasm32 target for contract compilation
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 RUN rustup target add wasm32-unknown-unknown
 
 WORKDIR /app
 
 # Cache dependencies before copying source
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 COPY contracts/ contracts/
 COPY metrics/ metrics/
 COPY integration-tests/ integration-tests/
+COPY api-server/ api-server/
 
 # Build all workspace members (native, for tests)
 RUN cargo build --workspace 2>&1
