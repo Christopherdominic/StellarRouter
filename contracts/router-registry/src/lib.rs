@@ -1185,4 +1185,83 @@ mod tests {
         let name = String::from_str(&env, "unknown");
         assert!(client.get_all_versions(&name).is_empty());
     }
+
+    #[test]
+    fn test_get_latest_with_constraint_version_zero_matching() {
+        // version 0 is not allowed to be registered, but constraint >=0 should match version 1
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+
+        let constraint = String::from_str(&env, ">=0");
+         let result = client.get_latest_with_constraint(&name, &Some(constraint));
+         assert_eq!(result.version, 1);
+    }
+
+    #[test]
+    fn test_get_latest_with_constraint_large_version() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        let large_v = u32::MAX;
+        client.register(&admin, &name, &addr, &large_v);
+
+        let constraint = String::from_str(&env, "4294967295"); // u32::MAX
+        let result = client.get_latest_with_constraint(&name, &Some(constraint));
+        assert_eq!(result.version, large_v);
+
+        let gte_constraint = String::from_str(&env, ">=4294967295");
+        let result_gte = client.get_latest_with_constraint(&name, &Some(gte_constraint));
+        assert_eq!(result_gte.version, large_v);
+    }
+
+    #[test]
+    fn test_get_latest_with_constraint_caret_zero() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+
+        // ^0 means >=0 and <1. Since version 1 is registered, ^0 should NOT match.
+        let constraint = String::from_str(&env, "^0");
+        let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
+        assert_eq!(result, Err(Ok(RegistryError::NotFound)));
+    }
+
+    #[test]
+    fn test_get_latest_with_constraint_tilde_zero() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+
+        // ~0 means >=0 and <1. Since version 1 is registered, ~0 should NOT match.
+        let constraint = String::from_str(&env, "~0");
+        let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
+        assert_eq!(result, Err(Ok(RegistryError::NotFound)));
+    }
+
+    #[test]
+    fn test_get_latest_with_constraint_invalid_strings() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr = Address::generate(&env);
+        client.register(&admin, &name, &addr, &1);
+
+        let invalid_cases = vec![
+            &env,
+            String::from_str(&env, ""),
+            String::from_str(&env, ">="),
+            String::from_str(&env, "^"),
+            String::from_str(&env, "~"),
+            String::from_str(&env, "v1"),
+            String::from_str(&env, "1.0.0"), // we only support u32
+        ];
+
+        for constraint in invalid_cases.iter() {
+            let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
+            assert_eq!(result, Err(Ok(RegistryError::InvalidConstraint)));
+        }
+    }
 }
