@@ -356,6 +356,65 @@ Removes the expiry entry for a role grant (cleanup function). Only super-admin.
 
 ---
 
+## router-quote
+
+**Contract:** `RouterQuote`
+**Purpose:** Read-only quote previews for single-hop and multi-hop routes, including expected output, fees, slippage bounds, and a fixed-point exchange rate.
+
+### `get_quote(router_core, route_name, token_in, token_out, amount_in, fee_bps, slippage_bps, precision) → Result<QuoteResponse, QuoteError>`
+Returns a quote for one liquidity plugin route. The call previews the swap result only; it does not execute a transfer.
+
+**Errors:** `InvalidAmount`, `InvalidPrecision`, `InvalidSlippage`, `InvalidRoute`, `RouteNotFound`, `QuoteFailed`
+
+---
+
+### `get_multihop_quote(hops, amount_in, slippage_bps, precision) → Result<QuoteResponse, QuoteError>`
+Returns an end-to-end quote for an ordered route of liquidity plugin hops. The `amount_out` from each hop becomes the `amount_in` for the next hop.
+
+**Errors:** `EmptyRoute`, `RouteTooLong`, `InvalidAmount`, `InvalidPrecision`, `InvalidSlippage`, `QuoteFailed`
+
+---
+
+### Quote Precision And Rounding
+
+`exchange_rate` is returned as a fixed-point integer instead of a floating-point decimal:
+
+```text
+exchange_rate = floor(amount_out * 10^precision / amount_in)
+```
+
+`precision` is the number of decimal places encoded in `exchange_rate`. The contract accepts precision values from `1` through `18`; `6` is the typical default for UI and API clients.
+
+For tokens with the same decimal count, convert the returned value to a human-readable rate like this:
+
+```text
+display_rate = exchange_rate / 10^precision
+```
+
+For tokens with different decimal counts, adjust for token base units:
+
+```text
+display_rate = (exchange_rate / 10^precision) * 10^(token_in_decimals - token_out_decimals)
+```
+
+Example with equal token decimals:
+
+| `amount_in` | `amount_out` | `precision` | `exchange_rate` | Display rate |
+|---:|---:|---:|---:|---:|
+| `1_000000` | `2_000000` | `6` | `2_000000` | `2.000000` |
+| `3_000000` | `1_000000` | `6` | `333333` | `0.333333` |
+
+Rounding is deterministic and always truncates toward zero because Soroban integer division is used. The contract does not round up fractional remainders, so clients should treat the value as a floor estimate of the exact rate. Fee amounts and `min_amount_out` use the same integer-division behavior:
+
+```text
+fee_amount = floor(amount_in * fee_bps / 10_000)
+min_amount_out = floor(amount_out * (10_000 - slippage_bps) / 10_000)
+```
+
+For UI display, keep the integer values for transaction decisions and apply formatting only at the presentation layer. For comparisons, compare fixed-point integers at the same `precision` rather than converting through floating-point numbers.
+
+---
+
 ## router-middleware
 
 **Contract:** `RouterMiddleware`  
