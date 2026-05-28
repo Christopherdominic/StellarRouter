@@ -174,13 +174,8 @@ impl RouterCore {
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
 
-        if Self::is_empty_or_whitespace(&name) {
-            return Err(RouterError::InvalidRouteName);
-        }
-
-        if env.storage().instance().has(&DataKey::Route(name.clone())) {
-            return Err(RouterError::RouteAlreadyExists);
-        }
+        // Use shared validation helper
+        Self::validate_route_name(&env, &name)?;
 
         // Validate metadata if provided
         if let Some(ref meta) = metadata {
@@ -621,21 +616,8 @@ impl RouterCore {
             return Err(RouterError::RouteNotFound);
         }
 
-        // Check alias doesn't already exist as route or alias
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::Route(alias_name.clone()))
-        {
-            return Err(RouterError::RouteAlreadyExists);
-        }
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::Alias(alias_name.clone()))
-        {
-            return Err(RouterError::RouteAlreadyExists);
-        }
+        // Use shared validation helper for alias name
+        Self::validate_route_name(&env, &alias_name)?;
 
         env.storage()
             .instance()
@@ -944,6 +926,39 @@ impl RouterCore {
         }
         let s = name.to_string();
         s.bytes().all(|b| matches!(b, 9 | 10 | 11 | 12 | 13 | 32))
+    }
+
+    /// Validates a route name for use in register_route and add_alias.
+    ///
+    /// Ensures the name is not empty or whitespace-only, and does not conflict
+    /// with existing routes or aliases.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `name` - The route or alias name to validate.
+    ///
+    /// # Returns
+    /// `Ok(())` if the name is valid and available.
+    ///
+    /// # Errors
+    /// * [`RouterError::InvalidRouteName`] — if the name is empty or whitespace-only.
+    /// * [`RouterError::RouteAlreadyExists`] — if the name conflicts with an existing route or alias.
+    fn validate_route_name(env: &Env, name: &String) -> Result<(), RouterError> {
+        if Self::is_empty_or_whitespace(name) {
+            return Err(RouterError::InvalidRouteName);
+        }
+
+        // Check if name already exists as a route
+        if env.storage().instance().has(&DataKey::Route(name.clone())) {
+            return Err(RouterError::RouteAlreadyExists);
+        }
+
+        // Check if name already exists as an alias
+        if env.storage().instance().has(&DataKey::Alias(name.clone())) {
+            return Err(RouterError::RouteAlreadyExists);
+        }
+
+        Ok(())
     }
 }
 
@@ -2100,3 +2115,94 @@ mod tests {
         let best = client.get_best_route(&candidates, &1000, &None).unwrap();
         assert_eq!(best, None);
     }
+
+    // ── Issue #511: Route validation tests ───────────────────────────────────
+
+    #[test]
+    fn test_validate_route_name_rejects_empty_string() {
+        let (env, admin, client) = setup();
+        let empty_name = String::from_str(&env, "");
+        let addr = Address::generate(&env);
+        let result = client.try_register_route(&admin, &empty_name, &addr, &None);
+        assert_eq!(result, Err(Ok(RouterError::InvalidRouteName)));
+    }
+
+    #[test]
+    fn test_validate_route_name_rejects_whitespace_only() {
+        let (env, admin, client) = setup();
+        let whitespace_name = String::from_str(&env, "   ");
+        let addr = Address::generate(&env);
+        let result = client.try_register_route(&admin, &whitespace_name, &addr, &None);
+        assert_eq!(result, Err(Ok(RouterError::InvalidRouteName)));
+    }
+
+    #[test]
+    fn test_validate_route_name_prevents_duplicate_route() {
+        let (env, admin, client) = setup();
+        let name = String::from_str(&env, "oracle");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        
+        client.register_route(&admin, &name, &addr1, &None);
+        let result = client.try_register_route(&admin, &name, &addr2, &None);
+        assert_eq!(result, Err(Ok(RouterError::RouteAlreadyExists)));
+    }
+
+    #[test]
+    fn test_validate_route_name_prevents_alias_as_route() {
+        let (env, admin, client) = setup();
+        let route_name = String::from_str(&env, "oracle");
+        let alias_name = String::from_str(&env, "oracle_v1");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        
+        // Register route and create alias
+        client.register_route(&admin, &route_name, &addr1, &None);
+        client.add_alias(&admin, &route_name, &alias_name);
+        
+        // Try to register a route with the same name as the alias
+        let result = client.try_register_route(&admin, &alias_name, &addr2, &None);
+        assert_eq!(result, Err(Ok(RouterError::RouteAlreadyExists)));
+    }
+
+    #[test]
+    fn test_validate_route_name_prevents_route_as_alias() {
+        let (env, admin, client) = setup();
+        let route1 = String::from_str(&env, "oracle");
+        let route2 = String::from_str(&env, "vault");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        
+        // Register two routes
+        client.register_route(&admin, &route1, &addr1, &None);
+        client.register_route(&admin, &route2, &addr2, &None);
+        
+        // Try to create an alias with the same name as an existing route
+        let result = client.try_add_alias(&admin, &route1, &route2);
+        assert_eq!(result, Err(Ok(RouterError::RouteAlreadyExists)));
+    }
+
+    #[test]
+    fn test_validate_route_name_alias_empty_string_fails() {
+        let (env, admin, client) = setup();
+        let route_name = String::from_str(&env, "oracle");
+        let empty_alias = String::from_str(&env, "");
+        let addr = Address::generate(&env);
+        
+        client.register_route(&admin, &route_name, &addr, &None);
+        let result = client.try_add_alias(&admin, &route_name, &empty_alias);
+        assert_eq!(result, Err(Ok(RouterError::InvalidRouteName)));
+    }
+
+    #[test]
+    fn test_validate_route_name_alias_whitespace_fails() {
+        let (env, admin, client) = setup();
+        let route_name = String::from_str(&env, "oracle");
+        let whitespace_alias = String::from_str(&env, "\t\n ");
+        let addr = Address::generate(&env);
+        
+        client.register_route(&admin, &route_name, &addr, &None);
+        let result = client.try_add_alias(&admin, &route_name, &whitespace_alias);
+        assert_eq!(result, Err(Ok(RouterError::InvalidRouteName)));
+    }
+}

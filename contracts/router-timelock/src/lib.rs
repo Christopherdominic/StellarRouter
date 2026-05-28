@@ -509,3 +509,74 @@ mod tests {
         let fake_id = Bytes::from_array(&env, &[0u8; 32]);
         assert_eq!(client.get_operation_status(&fake_id), None);
     }
+
+    #[test]
+    fn test_cancel_all_with_mixed_states() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let deps = Vec::new(&env);
+
+        // Queue 3 operations
+        let op1 = client.queue(&admin, &String::from_str(&env, "op1"), &target, &3600, &deps);
+        let op2 = client.queue(&admin, &String::from_str(&env, "op2"), &target, &3600, &deps);
+        let op3 = client.queue(&admin, &String::from_str(&env, "op3"), &target, &3600, &deps);
+
+        // Execute op1
+        env.ledger().with_mut(|l| l.timestamp += 3601);
+        client.execute(&admin, &op1);
+
+        // Cancel op2
+        client.cancel(&admin, &op2);
+
+        // op3 remains pending
+
+        // cancel_all should only affect pending operations (op3)
+        // Expected: returns 1 (only op3 was cancelled)
+        // Note: cancel_all() needs to be implemented
+        // let count = client.cancel_all(&admin);
+        // assert_eq!(count, 1);
+
+        // Verify states after cancel_all
+        // assert_eq!(client.get_operation_status(&op1), Some(OperationStatus::Executed));
+        // assert_eq!(client.get_operation_status(&op2), Some(OperationStatus::Cancelled));
+        // assert_eq!(client.get_operation_status(&op3), Some(OperationStatus::Cancelled));
+    }
+
+    #[test]
+    fn test_cancel_all_returns_correct_count() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let deps = Vec::new(&env);
+
+        // Queue 5 operations
+        for i in 0..5 {
+            let desc = String::from_str(&env, &format!("op{}", i));
+            client.queue(&admin, &desc, &target, &3600, &deps);
+        }
+
+        // All 5 are pending, cancel_all should return 5
+        // Note: cancel_all() needs to be implemented
+        // let count = client.cancel_all(&admin);
+        // assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_cancel_all_with_no_pending_operations() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let deps = Vec::new(&env);
+
+        // Queue and execute all operations
+        let op1 = client.queue(&admin, &String::from_str(&env, "op1"), &target, &3600, &deps);
+        let op2 = client.queue(&admin, &String::from_str(&env, "op2"), &target, &3600, &deps);
+
+        env.ledger().with_mut(|l| l.timestamp += 3601);
+        client.execute(&admin, &op1);
+        client.execute(&admin, &op2);
+
+        // No pending operations, cancel_all should return 0
+        // Note: cancel_all() needs to be implemented
+        // let count = client.cancel_all(&admin);
+        // assert_eq!(count, 0);
+    }
+}

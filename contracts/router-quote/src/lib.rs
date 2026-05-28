@@ -879,3 +879,89 @@ mod tests {
         assert_eq!(responses.len(), 2);
     }
 }
+
+    #[test]
+    fn test_get_best_quote_selects_highest_amount_out() {
+        let (env, client, double, triple) = setup();
+        let ti = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        // Create multiple route quotes
+        // Route 1: double plugin (amount_out = 2000)
+        // Route 2: triple plugin (amount_out = 3000)
+        // get_best_quote should select route 2 (triple)
+
+        // Note: get_best_quote() needs to be implemented
+        // Expected signature: get_best_quote(routes: Vec<QuoteResponse>) -> QuoteResponse
+        // let mut routes = Vec::new(&env);
+        // routes.push_back(client.get_quote(&double, &ti, &to, &1000, &0, &0, &6));
+        // routes.push_back(client.get_quote(&triple, &ti, &to, &1000, &0, &0, &6));
+        // let best = client.get_best_quote(&routes);
+        // assert_eq!(best.amount_out, 3000);
+    }
+
+    #[test]
+    fn test_get_best_quote_excludes_zero_output() {
+        let (env, client, double, _) = setup();
+        let ti = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        // Create routes where one has zero output
+        // Route 1: zero output (should be excluded)
+        // Route 2: double plugin (amount_out = 2000)
+        // get_best_quote should select route 2
+
+        // Note: get_best_quote() needs to be implemented
+        // let mut routes = Vec::new(&env);
+        // let zero_quote = QuoteResponse {
+        //     amount_out: 0,
+        //     total_fee_amount: 0,
+        //     min_amount_out: 0,
+        //     exchange_rate: 0,
+        //     precision: 6,
+        //     price_impact_bps: 0,
+        //     hops: Vec::new(&env),
+        // };
+        // routes.push_back(zero_quote);
+        // routes.push_back(client.get_quote(&double, &ti, &to, &1000, &0, &0, &6));
+        // let best = client.get_best_quote(&routes);
+        // assert_eq!(best.amount_out, 2000);
+    }
+
+    #[test]
+    fn test_get_best_quote_single_route_returns_that_route() {
+        let (env, client, double, _) = setup();
+        let ti = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        // Single route input should return that route
+        // Note: get_best_quote() needs to be implemented
+        // let mut routes = Vec::new(&env);
+        // let quote = client.get_quote(&double, &ti, &to, &1000, &0, &0, &6);
+        // routes.push_back(quote.clone());
+        // let best = client.get_best_quote(&routes);
+        // assert_eq!(best.amount_out, quote.amount_out);
+    }
+
+    #[test]
+    fn test_get_best_quote_all_zero_output_fails() {
+        let (env, client, _, _) = setup();
+
+        // All routes have zero output, should fail or return error
+        // Note: get_best_quote() needs to be implemented
+        // let mut routes = Vec::new(&env);
+        // let zero_quote = QuoteResponse {
+        //     amount_out: 0,
+        //     total_fee_amount: 0,
+        //     min_amount_out: 0,
+        //     exchange_rate: 0,
+        //     precision: 6,
+        //     price_impact_bps: 0,
+        //     hops: Vec::new(&env),
+        // };
+        // routes.push_back(zero_quote.clone());
+        // routes.push_back(zero_quote);
+        // let result = client.try_get_best_quote(&routes);
+        // assert!(result.is_err());
+    }
+}

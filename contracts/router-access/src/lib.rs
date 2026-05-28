@@ -1599,3 +1599,68 @@ mod tests {
         assert_eq!(result, Err(Ok(AccessError::Unauthorized)));
     }
 }
+
+    // ── Issue #510: Additional bulk operation tests ──────────────────────────
+
+    #[test]
+    fn test_bulk_grant_role_with_blacklisted_address() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+        let u3 = Address::generate(&env);
+
+        // Blacklist u2
+        client.blacklist(&admin, &u2, &None::<String>, &None);
+
+        let accounts = soroban_sdk::vec![&env, u1.clone(), u2.clone(), u3.clone()];
+        let results = client.grant_role_batch(&admin, &accounts, &role, &None);
+
+        // u1 should succeed, u2 should fail with Blacklisted, u3 should succeed
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        assert_eq!(results.get(1).unwrap(), Err(AccessError::Blacklisted));
+        assert_eq!(results.get(2).unwrap(), Ok(()));
+
+        // Verify final state
+        assert!(client.has_role(&u1, &role));
+        assert!(!client.has_role(&u2, &role));
+        assert!(client.has_role(&u3, &role));
+    }
+
+    #[test]
+    fn test_bulk_grant_role_empty_list() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let accounts = soroban_sdk::Vec::new(&env);
+        let results = client.grant_role_batch(&admin, &accounts, &role, &None);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_bulk_revoke_role_empty_list() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let targets = soroban_sdk::Vec::new(&env);
+        let results = client.revoke_role_batch(&admin, &role, &targets);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_bulk_grant_role_all_blacklisted() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+
+        // Blacklist both
+        client.blacklist(&admin, &u1, &None::<String>, &None);
+        client.blacklist(&admin, &u2, &None::<String>, &None);
+
+        let accounts = soroban_sdk::vec![&env, u1.clone(), u2.clone()];
+        let results = client.grant_role_batch(&admin, &accounts, &role, &None);
+
+        // Both should fail
+        assert_eq!(results.get(0).unwrap(), Err(AccessError::Blacklisted));
+        assert_eq!(results.get(1).unwrap(), Err(AccessError::Blacklisted));
+    }
+}
