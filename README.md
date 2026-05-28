@@ -7,29 +7,86 @@ A modular cross-contract routing infrastructure suite for Stellar/Soroban.
 `stellar-router` provides a complete set of infrastructure primitives for building
 composable, upgradeable, and access-controlled multi-contract systems on Soroban.
 
+### System Architecture
+
+```mermaid
+graph TD
+    %% User/External Interaction
+    User([User / Client Application])
+    API[API Server]
+    Metrics[Metrics Exporter]
+
+    %% Core Components
+    subgraph "On-Chain Infrastructure (Soroban)"
+        Core[router-core]
+        Registry[router-registry]
+        Access[router-access]
+        Middleware[router-middleware]
+        Timelock[router-timelock]
+        Multicall[router-multicall]
+        Execution[router-execution]
+        Quote[router-quote]
+    end
+
+    %% External Systems
+    RPC[Stellar RPC Node]
+    Prometheus[(Prometheus / Grafana)]
+
+    %% Connections
+    User --> API
+    API --> RPC
+    RPC <--> Core
+    
+    %% Internal Dependency/Flow
+    Core --> Registry : lookup address
+    Core --> Access : verify permissions
+    Core --> Middleware : pre/post call hooks
+    Core --> Timelock : queue sensitive changes
+    
+    Execution --> Core : resolve routes
+    Quote --> Execution : simulate flow
+    
+    Multicall --> Core : batch resolution
+    
+    %% Monitoring Flow
+    Metrics --> RPC : poll contract state
+    Metrics --> Prometheus : expose metrics
+    API -.-> Prometheus : query for dashboards
+    
+    %% Styling
+    style Core fill:#f9f,stroke:#333,stroke-width:4px
+    style Registry fill:#dfd,stroke:#333
+    style Access fill:#dfd,stroke:#333
+    style Middleware fill:#ffd,stroke:#333
+    style Timelock fill:#ffd,stroke:#333
+    style Execution fill:#ddf,stroke:#333
+    style Quote fill:#ddf,stroke:#333
 ```
-┌─────────────────────────────────────────────────────┐
-│                    router-core                      │
-│         Central dispatcher & route resolver         │
-└────────────┬────────────────────────┬───────────────┘
-             │                        │
-    ┌────────▼────────┐      ┌────────▼────────┐
-    │ router-registry │      │  router-access  │
-    │ Contract address│      │  Role-based ACL │
-    │ versioning      │      │  & whitelisting │
-    └─────────────────┘      └─────────────────┘
-             │                        │
-    ┌────────▼────────┐      ┌────────▼────────┐
-    │router-middleware│      │router-timelock  │
-    │ Rate limiting   │      │ Delayed change  │
-    │ Call logging    │      │ execution queue │
-    └─────────────────┘      └─────────────────┘
-                      │
-             ┌────────▼────────┐
-             │router-multicall │
-             │ Batch calls in  │
-             │ one transaction │
-             └─────────────────┘
+
+### Route Resolution Flow
+
+```mermaid
+sequenceDiagram
+    participant User as Caller
+    participant Core as router-core
+    participant Registry as router-registry
+    participant Access as router-access
+    participant MW as router-middleware
+    participant Target as Target Contract
+
+    User->>Core: resolve(route_name)
+    Core->>Access: check_auth(caller, route)
+    Access-->>Core: authorized
+    Core->>MW: pre_call(route_name)
+    MW-->>Core: ok (rate limit check)
+    Core->>Registry: get_latest(route_name)
+    Registry-->>Core: address: v2.1.0
+    Core-->>User: address
+    
+    Note over User, Target: Optional Execution Flow
+    User->>Target: call(params)
+    Core->>MW: post_call(route_name)
+    MW-->>Core: log event
 ```
 
 ## Contracts

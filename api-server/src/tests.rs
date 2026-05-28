@@ -1,34 +1,35 @@
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-    routing::{get, post},
-    Router,
-};
+use axum::{body::Body, http::{Request, StatusCode}, routing::{get, post}, Router};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use crate::{
     handlers,
-    rpc::SorobanRpcClient,
     state::AppState,
-    types::SimulateResponse,
+    types::{
+        RouteDetails,
+        SimulateRequest,
+        SimulateResponse,
+        TransactionStatus,
+        TransactionStatusEvent,
+    },
 };
 
 /// Valid 56-char Stellar contract ID for use in tests.
-const VALID_CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+const VALID_CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
 
 fn test_app() -> Router {
-    // Use a non-existent RPC URL — the client will fall back to heuristic estimates
-    let rpc = SorobanRpcClient::new("http://localhost:1", None);
-    let state = AppState::new(rpc);
+    let state = AppState::new(
+        "http://localhost:1".to_string(),
+        "".to_string(),
+        "".to_string(),
+    );
+
     Router::new()
         .route("/health", get(handlers::health))
         .route("/simulate", post(handlers::simulate))
         .route("/routes/:name", get(handlers::get_route))
         .with_state(state)
 }
-
-// ── GET /health ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_health_returns_200() {
@@ -52,8 +53,6 @@ async fn test_health_returns_ok_body() {
     assert_eq!(json["status"], "ok");
 }
 
-// ── POST /simulate — success paths ───────────────────────────────────────────
-
 #[tokio::test]
 async fn test_simulate_returns_200_with_valid_request() {
     let app = test_app();
@@ -62,7 +61,7 @@ async fn test_simulate_returns_200_with_valid_request() {
         "function": "transfer",
         "amount": 1_000_000,
         "fee_bps": 30,
-        "network_load_bps": 5000
+        "network_load_bps": 5000,
     });
     let resp = app
         .oneshot(
@@ -108,7 +107,7 @@ async fn test_simulate_surge_pricing_at_high_load() {
         "target": VALID_CONTRACT_ID,
         "function": "transfer",
         "amount": 1_000_000,
-        "network_load_bps": 9000
+        "network_load_bps": 9000,
     });
     let resp = app
         .oneshot(
@@ -126,8 +125,6 @@ async fn test_simulate_surge_pricing_at_high_load() {
     assert!(parsed.estimated_fees.high_load);
     assert_eq!(parsed.estimated_fees.surge_multiplier, 200);
 }
-
-// ── POST /simulate — validation ───────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_simulate_missing_target_returns_400() {
@@ -189,10 +186,9 @@ async fn test_simulate_invalid_contract_id_returns_400() {
 #[tokio::test]
 async fn test_simulate_contract_id_not_starting_with_c_returns_400() {
     let app = test_app();
-    // 56 chars but starts with G (account ID, not contract ID)
     let body = json!({
         "target": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
-        "function": "transfer"
+        "function": "transfer",
     });
     let resp = app
         .oneshot(
@@ -228,14 +224,8 @@ async fn test_simulate_empty_body_returns_400_or_422() {
     );
 }
 
-// ── GET /routes/:name ─────────────────────────────────────────────────────────
-
 #[tokio::test]
-async fn test_get_route_returns_404_when_core_not_configured() {
-    // With no ROUTER_CORE_CONTRACT_ID configured the RPC client returns an
-    // error, which the handler maps to 500. But when the RPC is unreachable
-    // and the contract ID is missing we get a 500 (not 404). This test
-    // verifies the endpoint exists and returns a non-200 error code.
+async fn test_get_route_returns_500_when_core_not_configured() {
     let app = test_app();
     let resp = app
         .oneshot(
@@ -246,7 +236,6 @@ async fn test_get_route_returns_404_when_core_not_configured() {
         )
         .await
         .unwrap();
-    // 500 because ROUTER_CORE_CONTRACT_ID is not set in the test environment
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let json: Value = serde_json::from_slice(&bytes).unwrap();
@@ -266,7 +255,46 @@ async fn test_get_route_error_response_is_json() {
         .await
         .unwrap();
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    // Must be valid JSON with an "error" field
     let json: Value = serde_json::from_slice(&bytes).unwrap();
     assert!(json.get("error").is_some());
+}
+
+#[test]
+fn test_simulate_request_serialization() {
+    let req = SimulateRequest {
+        target: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".to_string(),
+        function: "transfer".to_string(),
+        amount: 1_000_000,
+        fee_bps: 30,
+        network_load_bps: 0,
+        route_details: Some(RouteDetails {
+            name: "swap".to_string(),
+            version: Some(1),
+            expected_outputs: Some(vec!["1000000".to_string()]),
+        }),
+    };
+
+    let json = serde_json::to_string(&req).unwrap();
+    let deserialized: SimulateRequest = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(deserialized.target, req.target);
+    assert_eq!(deserialized.function, req.function);
+}
+
+#[test]
+fn test_transaction_status_event_serialization() {
+    let event = TransactionStatusEvent {
+        tx_id: "tx_12345".to_string(),
+        status: TransactionStatus::Pending,
+        timestamp: "2026-05-28T00:00:00Z".to_string(),
+        message: Some("waiting".to_string()),
+    };
+
+    let json = serde_json::to_string(&event).unwrap();
+    let deserialized: TransactionStatusEvent = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(deserialized.tx_id, event.tx_id);
+    assert_eq!(deserialized.status, event.status);
+    assert_eq!(deserialized.timestamp, event.timestamp);
+    assert_eq!(deserialized.message, event.message);
 }

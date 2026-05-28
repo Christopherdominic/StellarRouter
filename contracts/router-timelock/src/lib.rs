@@ -45,6 +45,20 @@ pub struct Op {
     pub cancelled: bool,
 }
 
+/// Human-readable status of a timelock operation.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum OperationStatus {
+    /// Queued and waiting for ETA to elapse.
+    Queued,
+    /// ETA has elapsed but not yet executed.
+    Ready,
+    /// Successfully executed.
+    Executed,
+    /// Cancelled before execution.
+    Cancelled,
+}
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -195,6 +209,29 @@ impl RouterTimelock {
     /// Get an operation by id.
     pub fn get_op(env: Env, op_id: Bytes) -> Option<Op> {
         env.storage().instance().get(&DataKey::Op(op_id))
+    }
+
+    /// Get the human-readable status of an operation.
+    ///
+    /// # Returns
+    /// * `Cancelled` — if the operation was cancelled.
+    /// * `Executed` — if the operation was executed.
+    /// * `Ready` — if the ETA has elapsed but the operation has not been executed.
+    /// * `Queued` — if the ETA has not yet elapsed.
+    ///
+    /// Returns `None` if no operation with `op_id` exists.
+    pub fn get_operation_status(env: Env, op_id: Bytes) -> Option<OperationStatus> {
+        let op: Op = env.storage().instance().get(&DataKey::Op(op_id))?;
+        let status = if op.cancelled {
+            OperationStatus::Cancelled
+        } else if op.executed {
+            OperationStatus::Executed
+        } else if env.ledger().timestamp() >= op.eta {
+            OperationStatus::Ready
+        } else {
+            OperationStatus::Queued
+        };
+        Some(status)
     }
 
     /// Get the minimum delay.
@@ -421,4 +458,54 @@ mod tests {
         let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
         assert_eq!(topic, Symbol::new(&env, "op_cancelled"));
     }
-}
+
+    #[test]
+    fn test_get_operation_status_queued() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = Vec::new(&env);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        assert_eq!(client.get_operation_status(&op_id), Some(OperationStatus::Queued));
+    }
+
+    #[test]
+    fn test_get_operation_status_ready() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = Vec::new(&env);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        env.ledger().with_mut(|l| l.timestamp += 3601);
+        assert_eq!(client.get_operation_status(&op_id), Some(OperationStatus::Ready));
+    }
+
+    #[test]
+    fn test_get_operation_status_executed() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = Vec::new(&env);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        env.ledger().with_mut(|l| l.timestamp += 3601);
+        client.execute(&admin, &op_id);
+        assert_eq!(client.get_operation_status(&op_id), Some(OperationStatus::Executed));
+    }
+
+    #[test]
+    fn test_get_operation_status_cancelled() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = Vec::new(&env);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        client.cancel(&admin, &op_id);
+        assert_eq!(client.get_operation_status(&op_id), Some(OperationStatus::Cancelled));
+    }
+
+    #[test]
+    fn test_get_operation_status_nonexistent_returns_none() {
+        let (env, _admin, client) = setup();
+        let fake_id = Bytes::from_array(&env, &[0u8; 32]);
+        assert_eq!(client.get_operation_status(&fake_id), None);
+    }

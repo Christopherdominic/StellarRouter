@@ -168,6 +168,51 @@ Before deploying to mainnet:
 
 ---
 
+## Role Hierarchy and Inheritance
+
+The `router-access` contract supports a directed acyclic graph (DAG) of roles. This allows for complex permission structures where higher-level roles automatically inherit the permissions of lower-level roles.
+
+### Example: Admin → Editor → Viewer
+
+A common setup is a three-tier hierarchy:
+1.  **Viewer**: Can read data.
+2.  **Editor**: Can read and modify data.
+3.  **Admin**: Can read, modify, and manage permissions.
+
+To set this up using `router-access`:
+
+```bash
+# 1. Set Editor as the parent of Viewer (Editor → Viewer)
+# Anyone with 'editor' role now implicitly has 'viewer' role
+stellar contract invoke --id <ACCESS_ID> -- \
+  set_role_parent --caller <SUPER_ADMIN> --role "viewer" --parent_role "editor"
+
+# 2. Set Admin as the parent of Editor (Admin → Editor)
+# Anyone with 'admin' role now implicitly has 'editor' AND 'viewer' roles
+stellar contract invoke --id <ACCESS_ID> -- \
+  set_role_parent --caller <SUPER_ADMIN> --role "editor" --parent_role "admin"
+
+# 3. Grant 'admin' to a user
+stellar contract invoke --id <ACCESS_ID> -- \
+  grant_role --admin <SUPER_ADMIN> --account <USER_ADDRESS> --role "admin"
+```
+
+### Inheritance Resolution
+
+Inheritance is resolved at check-time by walking up the ancestor chain:
+- `has_role(user, "viewer")` checks if the user has `viewer`, `editor`, or `admin` directly.
+- The check stops at a maximum depth of 16 to prevent gas exhaustion from deep hierarchies.
+- **Transitivity**: If A is parent of B, and B is parent of C, then A is implicitly a parent of C.
+
+### Common Pitfalls
+
+- **Cycles**: The contract prevents cycles (e.g., A → B → A) during `set_role_parent`. Attempting to create one returns `HierarchyCycle`.
+- **Blacklisting**: Blacklisting an address overrides all inherited roles. If an address is blacklisted, `has_role` returns `false` regardless of hierarchy.
+- **Revocation**: `revoke_role` only removes a **direct** grant. If a user has `admin` and you revoke `viewer`, they still have `viewer` because it is inherited from `admin`. To fully remove access, you must revoke the highest-level role in their chain.
+- **Super-Admin Bypass**: The `super_admin` does **not** implicitly hold all roles. They must grant themselves roles or be added to the hierarchy if they need to pass `has_role` checks in other contracts.
+
+---
+
 ## Reporting Security Issues
 
 If you discover a security vulnerability in stellar-router, please do **not**

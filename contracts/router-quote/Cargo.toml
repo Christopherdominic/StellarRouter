@@ -8,9 +8,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+router-common = { path = "../router-common" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+router-common = { path = "../router-common" }
 
 [profile.release]
 opt-level = "z"

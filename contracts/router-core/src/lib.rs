@@ -834,18 +834,22 @@ impl RouterCore {
     /// `liquidity_score + reliability_score - fee_bps / 10`
     ///
     /// Routes that are paused or have no score are skipped. Returns the name
-    /// of the highest-scoring available route.
+    /// of the highest-scoring available route, or `fallback_name` if no
+    /// candidate meets `min_score`.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
     /// * `candidates` - A list of route names to evaluate.
+    /// * `min_score` - Minimum composite score a route must reach to be selected.
+    /// * `fallback_name` - Returned when no candidate meets `min_score`.
     ///
     /// # Returns
-    /// The name of the best route, or `None` if no scoreable, unpaused route exists.
+    /// The name of the best route, `fallback_name` if none meet the threshold,
+    /// or `None` if no scoreable, unpaused route exists and no fallback is set.
     ///
     /// # Errors
     /// * [`RouterError::RouterPaused`] — if the entire router is paused.
-    pub fn get_best_route(env: Env, candidates: Vec<String>) -> Result<Option<String>, RouterError> {
+    pub fn get_best_route(env: Env, candidates: Vec<String>, min_score: i64, fallback_name: Option<String>) -> Result<Option<String>, RouterError> {
         let paused: bool = env
             .storage()
             .instance()
@@ -856,7 +860,7 @@ impl RouterCore {
         }
 
         let mut best_name: Option<String> = None;
-        let mut best_score: i64 = -1;
+        let mut best_score: i64 = i64::MIN;
 
         for name in candidates.iter() {
             // Skip paused routes
@@ -891,14 +895,20 @@ impl RouterCore {
             }
         }
 
-        if let Some(ref name) = best_name {
-            env.events().publish(
-                (Symbol::new(&env, "best_route_selected"),),
-                (name.clone(), best_score),
-            );
-        }
+        // Apply minimum score threshold: fall back if best doesn't meet it
+        let result = if best_score >= min_score {
+            if let Some(ref name) = best_name {
+                env.events().publish(
+                    (Symbol::new(&env, "best_route_selected"),),
+                    (name.clone(), best_score),
+                );
+            }
+            best_name
+        } else {
+            fallback_name
+        };
 
-        Ok(best_name)
+        Ok(result)
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -2016,7 +2026,7 @@ mod tests {
         client.set_route_score(&admin, &r3, &RouteScore { liquidity_score: 60, fee_bps: 50, reliability_score: 60 });
 
         let candidates = vec![&env, r1, r2.clone(), r3];
-        let best = client.get_best_route(&candidates).unwrap();
+        let best = client.get_best_route(&candidates, &0, &None).unwrap();
         assert_eq!(best, Some(r2));
     }
 
@@ -2036,7 +2046,7 @@ mod tests {
         client.set_route_paused(&admin, &r1, &true);
 
         let candidates = vec![&env, r1, r2.clone()];
-        let best = client.get_best_route(&candidates).unwrap();
+        let best = client.get_best_route(&candidates, &0, &None).unwrap();
         assert_eq!(best, Some(r2));
     }
 
@@ -2048,7 +2058,7 @@ mod tests {
         client.register_route(&admin, &r1, &addr, &None);
         // No score set
         let candidates = vec![&env, r1];
-        let best = client.get_best_route(&candidates).unwrap();
+        let best = client.get_best_route(&candidates, &0, &None).unwrap();
         assert_eq!(best, None);
     }
 
@@ -2057,7 +2067,36 @@ mod tests {
         let (env, admin, client) = setup();
         client.set_paused(&admin, &true);
         let candidates = Vec::new(&env);
-        let result = client.try_get_best_route(&candidates);
+        let result = client.try_get_best_route(&candidates, &0, &None);
         assert_eq!(result, Err(Ok(RouterError::RouterPaused)));
     }
-}
+
+    #[test]
+    fn test_get_best_route_fallback_when_below_min_score() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route_a");
+        let fallback = String::from_str(&env, "fallback_route");
+        let addr = Address::generate(&env);
+        client.register_route(&admin, &r1, &addr, &None);
+        // route_a: 50 + 50 - 10/10 = 99
+        client.set_route_score(&admin, &r1, &RouteScore { liquidity_score: 50, fee_bps: 10, reliability_score: 50 });
+
+        let candidates = vec![&env, r1];
+        // min_score = 200 — route_a (99) doesn't qualify → fallback returned
+        let best = client.get_best_route(&candidates, &200, &Some(fallback.clone())).unwrap();
+        assert_eq!(best, Some(fallback));
+    }
+
+    #[test]
+    fn test_get_best_route_no_fallback_returns_none_when_below_min_score() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route_a");
+        let addr = Address::generate(&env);
+        client.register_route(&admin, &r1, &addr, &None);
+        client.set_route_score(&admin, &r1, &RouteScore { liquidity_score: 10, fee_bps: 0, reliability_score: 10 });
+
+        let candidates = vec![&env, r1];
+        // min_score = 1000 — no route qualifies, no fallback
+        let best = client.get_best_route(&candidates, &1000, &None).unwrap();
+        assert_eq!(best, None);
+    }

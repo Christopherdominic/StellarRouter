@@ -29,6 +29,7 @@ pub enum DataKey {
     Admin,
     MaxBatchSize,
     TotalBatches,
+    Executing, // reentrancy guard
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -91,6 +92,7 @@ pub enum MulticallError {
     EmptyBatch = 5,
     RequiredCallFailed = 6,
     InvalidConfig = 7,
+    Reentrancy = 8,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -169,17 +171,27 @@ impl RouterMulticall {
     ) -> Result<BatchSummary, MulticallError> {
         caller.require_auth();
 
+        // Reentrancy guard
+        if env.storage().instance().get::<DataKey, bool>(&DataKey::Executing).unwrap_or(false) {
+            return Err(MulticallError::Reentrancy);
+        }
+        env.storage().instance().set(&DataKey::Executing, &true);
+
         if calls.is_empty() {
+            env.storage().instance().remove(&DataKey::Executing);
             return Err(MulticallError::EmptyBatch);
         }
 
-        let max: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MaxBatchSize)
-            .ok_or(MulticallError::NotInitialized)?;
+        let max: u32 = match env.storage().instance().get(&DataKey::MaxBatchSize) {
+            Some(v) => v,
+            None => {
+                env.storage().instance().remove(&DataKey::Executing);
+                return Err(MulticallError::NotInitialized);
+            }
+        };
 
         if calls.len() > max {
+            env.storage().instance().remove(&DataKey::Executing);
             return Err(MulticallError::BatchTooLarge);
         }
 
@@ -189,7 +201,6 @@ impl RouterMulticall {
         let total = calls.len();
 
         for call in calls.iter() {
-            // Attempt the cross-contract call with empty args
             let args: Vec<Val> = Vec::new(&env);
             let result = env.try_invoke_contract::<Val, Val>(&call.target, &call.function, args);
 
@@ -199,14 +210,11 @@ impl RouterMulticall {
                 succeeded += 1;
             } else {
                 failed += 1;
-                // The host does not expose a per-call CPU counter to guest contracts.
-                // We conservatively count any failed call that had a budget set as a
-                // potential budget overrun. This will be tightened once the host
-                // surfaces budget metering to contracts.
                 if call.instruction_budget.is_some() {
                     budget_exceeded_count += 1;
                 }
                 if call.required {
+                    env.storage().instance().remove(&DataKey::Executing);
                     return Err(MulticallError::RequiredCallFailed);
                 }
             }
@@ -217,7 +225,6 @@ impl RouterMulticall {
             );
         }
 
-        // Only increment batch counter if not simulating
         if !simulate {
             let batches: u64 = env
                 .storage()
@@ -226,6 +233,8 @@ impl RouterMulticall {
                 .unwrap_or(0);
             env.storage().instance().set(&DataKey::TotalBatches, &(batches + 1));
         }
+
+        env.storage().instance().remove(&DataKey::Executing);
 
         Ok(BatchSummary {
             total,
@@ -777,5 +786,55 @@ mod tests {
         let result = client.try_execute_batch(&caller, &calls, &false);
         assert_eq!(result, Err(Ok(MulticallError::RequiredCallFailed)));
         assert_eq!(client.total_batches(), 0);
+    }
+
+    #[test]
+    fn test_executing_flag_cleared_after_success() {
+        let (env, _admin, client) = setup();
+        let mock_id = env.register_contract(None, MockContract);
+        let caller = Address::generate(&env);
+
+        let mut calls = Vec::new(&env);
+        calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "success"),
+            required: true,
+            instruction_budget: None,
+        });
+
+        client.execute_batch(&caller, &calls, &false);
+
+        // Flag must be cleared — a second call must succeed (not return Reentrancy)
+        let result = client.try_execute_batch(&caller, &calls, &false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_executing_flag_cleared_after_required_failure() {
+        let (env, _admin, client) = setup();
+        let mock_id = env.register_contract(None, MockContract);
+        let caller = Address::generate(&env);
+
+        let mut fail_calls = Vec::new(&env);
+        fail_calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "fail"),
+            required: true,
+            instruction_budget: None,
+        });
+
+        // First call fails
+        let _ = client.try_execute_batch(&caller, &fail_calls, &false);
+
+        // Flag must be cleared — a subsequent call must not return Reentrancy
+        let mut ok_calls = Vec::new(&env);
+        ok_calls.push_back(CallDescriptor {
+            target: mock_id.clone(),
+            function: Symbol::new(&env, "success"),
+            required: true,
+            instruction_budget: None,
+        });
+        let result = client.try_execute_batch(&caller, &ok_calls, &false);
+        assert!(result.is_ok());
     }
 }

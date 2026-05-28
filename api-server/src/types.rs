@@ -15,10 +15,26 @@ pub struct SimulateRequest {
     /// Network load in basis points for surge pricing (0–10000)
     #[serde(default)]
     pub network_load_bps: u32,
+    #[serde(default)]
+    pub route_details: Option<RouteDetails>,
 }
 
-fn default_amount() -> i64 { 1_000_000 }
-fn default_fee_bps() -> u32 { 30 }
+fn default_amount() -> i64 {
+    1_000_000
+}
+
+fn default_fee_bps() -> u32 {
+    30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteDetails {
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<u32>,
+    #[serde(default)]
+    pub expected_outputs: Option<Vec<String>>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulateResponse {
@@ -42,6 +58,14 @@ pub struct SimulationDetail {
     pub target: String,
     pub function: String,
     pub would_succeed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteBreakdown {
+    pub route_name: String,
+    pub version: u32,
+    pub target_contract: String,
+    pub function: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,4 +114,10 @@ pub enum TransactionStatus {
 pub struct SubscribeMessage {
     pub action: String,
     pub tx_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsMessage {
+    pub msg_type: String,
+    pub data: serde_json::Value,
 }

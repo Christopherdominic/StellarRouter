@@ -7,15 +7,23 @@ use crate::{rpc::SorobanRpcClient, types::TransactionStatusEvent};
 #[derive(Clone)]
 pub struct AppState {
     pub rpc: SorobanRpcClient,
+    pub execution_contract_id: String,
+    pub router_core_contract_id: String,
     pub tx_status_tx: broadcast::Sender<TransactionStatusEvent>,
     pub tx_subscribers: Arc<DashMap<String, usize>>,
 }
 
 impl AppState {
-    pub fn new(rpc: SorobanRpcClient) -> Self {
+    pub fn new(
+        rpc_url: String,
+        execution_contract_id: String,
+        router_core_contract_id: String,
+    ) -> Self {
         let (tx_status_tx, _) = broadcast::channel(1000);
         Self {
-            rpc,
+            rpc: SorobanRpcClient::new(rpc_url, Some(router_core_contract_id.clone())),
+            execution_contract_id,
+            router_core_contract_id,
             tx_status_tx,
             tx_subscribers: Arc::new(DashMap::new()),
         }

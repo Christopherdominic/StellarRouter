@@ -20,7 +20,7 @@
 //! - `admin_transferred` — Admin transferred to new address
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, Env, Map, String, Symbol, Vec,
 };
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -28,13 +28,13 @@ use soroban_sdk::{
 #[contracttype]
 pub enum DataKey {
     Admin,
-    RateLimit(String, Address), // (route, address) -> RateLimitState
+    RouteCallState(String), // route_name -> RouteCallState
     RouteConfig(String),        // route_name -> RouteConfig
     GlobalEnabled,
     TotalCalls,
-    CircuitBreaker(String), // route_name -> CircuitBreakerState
-    CallLog(String),        // route_name -> Vec<CallLogEntry>
+    CallLog(String),        // route_name -> CallLogState
     ConfiguredRoutes,       // Vec<String>
+    CallLogSummary(String), // route_name -> CallLogSummary
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -78,6 +78,15 @@ pub struct CircuitBreakerState {
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
+pub struct RouteCallState {
+    /// Per-caller rate limit state for the route
+    pub rate_limits: Map<Address, RateLimitState>,
+    /// Route-level circuit breaker state
+    pub circuit_breaker: CircuitBreakerState,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CallLogEntry {
     /// The caller address
     pub caller: Address,
@@ -87,6 +96,24 @@ pub struct CallLogEntry {
     pub success: bool,
     /// The route that was called
     pub route: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallLogState {
+    /// Fixed-capacity call entries retained for the route
+    pub entries: Vec<CallLogEntry>,
+    /// Index of the oldest entry in `entries` (0 when not wrapped)
+    pub head: u32,
+/// Aggregated summary for a route's call log.
+/// Maintained incrementally to avoid loading all entries.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallLogSummary {
+    pub total_calls: u32,
+    pub success_count: u32,
+    pub failure_count: u32,
+    pub last_call_timestamp: u64,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -240,91 +267,95 @@ impl RouterMiddleware {
         }
 
         // 2. Compute new states (if applicable) without writing yet
-        let (new_rate_limit, cb_reset_state) = if let Some(config) =
+        let new_route_call_state = if let Some(config) =
             env.storage()
                 .instance()
                 .get::<DataKey, RouteConfig>(&DataKey::RouteConfig(route.clone()))
         {
+            let mut route_call_state: RouteCallState = env
+                .storage()
+                .instance()
+                .get(&DataKey::RouteCallState(route.clone()))
+                .unwrap_or(RouteCallState {
+                    rate_limits: Map::new(&env),
+                    circuit_breaker: CircuitBreakerState {
+                        failure_count: 0,
+                        opened_at: 0,
+                        is_open: false,
+                    },
+                });
+
             // 2a. Route enabled check
             if !config.enabled {
                 return Err(MiddlewareError::RouteDisabled);
             }
 
             // 2b. Circuit breaker check
-            let cb_reset_state: Option<CircuitBreakerState> = if config.failure_threshold > 0 {
-                let cb_state: CircuitBreakerState = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::CircuitBreaker(route.clone()))
-                    .unwrap_or(CircuitBreakerState {
-                        failure_count: 0,
-                        opened_at: 0,
-                        is_open: false,
-                    });
-
-                if cb_state.is_open {
+            let mut state_changed = false;
+            if config.failure_threshold > 0 {
+                if route_call_state.circuit_breaker.is_open {
                     let now = env.ledger().timestamp();
                     let recovers = config.recovery_window_seconds > 0
-                        && now >= cb_state.opened_at + config.recovery_window_seconds;
+                        && now
+                            >= route_call_state.circuit_breaker.opened_at
+                                + config.recovery_window_seconds;
                     if !recovers {
                         return Err(MiddlewareError::CircuitOpen);
                     }
-                    // Circuit should recover - prepare reset state
-                    Some(CircuitBreakerState {
+                    route_call_state.circuit_breaker = CircuitBreakerState {
                         failure_count: 0,
                         opened_at: 0,
                         is_open: false,
-                    })
-                } else {
-                    None
+                    };
+                    state_changed = true;
                 }
-            } else {
-                None
-            };
+            }
 
             // 2c. Rate limit check — compute new state but do not write yet
-            let new_rate_limit: Option<(DataKey, RateLimitState)> =
-                if config.max_calls_per_window > 0 {
-                    let now = env.ledger().timestamp();
-                    let state: RateLimitState = env
-                        .storage()
-                        .instance()
-                        .get(&DataKey::RateLimit(route.clone(), caller.clone()))
+            if config.max_calls_per_window > 0 {
+                let now = env.ledger().timestamp();
+                let state: RateLimitState =
+                    route_call_state
+                        .rate_limits
+                        .get(caller.clone())
                         .unwrap_or(RateLimitState {
                             calls_in_window: 0,
                             window_start: now,
                         });
 
-                    let window_elapsed = now >= state.window_start + config.window_seconds;
-                    let calls = if window_elapsed {
-                        0
-                    } else {
-                        state.calls_in_window
-                    };
-                    let window_start = if window_elapsed {
-                        now
-                    } else {
-                        state.window_start
-                    };
-
-                    if calls >= config.max_calls_per_window {
-                        return Err(MiddlewareError::RateLimitExceeded);
-                    }
-
-                    Some((
-                        DataKey::RateLimit(route.clone(), caller.clone()),
-                        RateLimitState {
-                            calls_in_window: calls + 1,
-                            window_start,
-                        },
-                    ))
+                let window_elapsed = now >= state.window_start + config.window_seconds;
+                let calls = if window_elapsed {
+                    0
                 } else {
-                    None
+                    state.calls_in_window
+                };
+                let window_start = if window_elapsed {
+                    now
+                } else {
+                    state.window_start
                 };
 
-            (new_rate_limit, cb_reset_state)
+                if calls >= config.max_calls_per_window {
+                    return Err(MiddlewareError::RateLimitExceeded);
+                }
+
+                route_call_state.rate_limits.set(
+                    caller.clone(),
+                    RateLimitState {
+                        calls_in_window: calls + 1,
+                        window_start,
+                    },
+                );
+                state_changed = true;
+            }
+
+            if state_changed {
+                Some(route_call_state)
+            } else {
+                None
+            }
         } else {
-            (None, None)
+            None
         };
 
         // ── Commit phase (all checks passed — write state atomically) ─────────
@@ -350,16 +381,11 @@ impl RouterMiddleware {
             }
         }
 
-        // Write rate limit state
-        if let Some((key, state)) = new_rate_limit {
-            env.storage().instance().set(&key, &state);
-        }
-
-        // Write circuit breaker reset state if recovery window elapsed
-        if let Some(reset_state) = cb_reset_state {
+        // Write combined route call state once (rate limit + circuit breaker)
+        if let Some(route_call_state) = new_route_call_state {
             env.storage()
                 .instance()
-                .set(&DataKey::CircuitBreaker(route.clone()), &reset_state);
+                .set(&DataKey::RouteCallState(route.clone()), &route_call_state);
         }
 
         // Increment global call counter
@@ -406,11 +432,14 @@ impl RouterMiddleware {
             .get::<DataKey, RouteConfig>(&DataKey::RouteConfig(route.clone()))
         {
             if config.log_retention > 0 {
-                let mut log: Vec<CallLogEntry> = env
+                let mut log: CallLogState = env
                     .storage()
                     .instance()
                     .get(&DataKey::CallLog(route.clone()))
-                    .unwrap_or(Vec::new(&env));
+                    .unwrap_or(CallLogState {
+                        entries: Vec::new(&env),
+                        head: 0,
+                    });
 
                 let entry = CallLogEntry {
                     caller: caller.clone(),
@@ -418,20 +447,41 @@ impl RouterMiddleware {
                     success,
                     route: route.clone(),
                 };
-                log.push_back(entry);
 
-                if log.len() > config.log_retention {
-                    // Remove oldest entry (ring buffer)
-                    let mut new_log = Vec::new(&env);
-                    for i in 1..log.len() {
-                        new_log.push_back(log.get(i).unwrap());
-                    }
-                    log = new_log;
+                let cap = config.log_retention;
+                if log.entries.len() < cap {
+                    log.entries.push_back(entry);
+                } else if cap > 0 {
+                    // Overwrite oldest slot and advance head (fixed-size ring buffer)
+                    log.entries.set(log.head, entry);
+                    log.head = (log.head + 1) % cap;
                 }
 
                 env.storage()
                     .instance()
                     .set(&DataKey::CallLog(route.clone()), &log);
+
+                // Update summary incrementally (avoids reloading all entries)
+                let mut summary: CallLogSummary = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::CallLogSummary(route.clone()))
+                    .unwrap_or(CallLogSummary {
+                        total_calls: 0,
+                        success_count: 0,
+                        failure_count: 0,
+                        last_call_timestamp: 0,
+                    });
+                summary.total_calls += 1;
+                if success {
+                    summary.success_count += 1;
+                } else {
+                    summary.failure_count += 1;
+                }
+                summary.last_call_timestamp = env.ledger().timestamp();
+                env.storage()
+                    .instance()
+                    .set(&DataKey::CallLogSummary(route.clone()), &summary);
             }
         }
 
@@ -442,30 +492,33 @@ impl RouterMiddleware {
                 .get::<DataKey, RouteConfig>(&DataKey::RouteConfig(route.clone()))
             {
                 if config.failure_threshold > 0 {
-                    let mut cb_state: CircuitBreakerState = env
+                    let mut route_call_state: RouteCallState = env
                         .storage()
                         .instance()
-                        .get(&DataKey::CircuitBreaker(route.clone()))
-                        .unwrap_or(CircuitBreakerState {
-                            failure_count: 0,
-                            opened_at: 0,
-                            is_open: false,
+                        .get(&DataKey::RouteCallState(route.clone()))
+                        .unwrap_or(RouteCallState {
+                            rate_limits: Map::new(&env),
+                            circuit_breaker: CircuitBreakerState {
+                                failure_count: 0,
+                                opened_at: 0,
+                                is_open: false,
+                            },
                         });
 
-                    cb_state.failure_count += 1;
+                    route_call_state.circuit_breaker.failure_count += 1;
 
-                    if cb_state.failure_count >= config.failure_threshold {
-                        cb_state.is_open = true;
-                        cb_state.opened_at = env.ledger().timestamp();
+                    if route_call_state.circuit_breaker.failure_count >= config.failure_threshold {
+                        route_call_state.circuit_breaker.is_open = true;
+                        route_call_state.circuit_breaker.opened_at = env.ledger().timestamp();
                         env.events().publish(
                             (Symbol::new(&env, "circuit_opened"),),
-                            (route.clone(), cb_state.failure_count),
+                            (route.clone(), route_call_state.circuit_breaker.failure_count),
                         );
                     }
 
                     env.storage()
                         .instance()
-                        .set(&DataKey::CircuitBreaker(route), &cb_state);
+                        .set(&DataKey::RouteCallState(route), &route_call_state);
                 }
             }
         } else {
@@ -475,21 +528,26 @@ impl RouterMiddleware {
                 .get::<DataKey, RouteConfig>(&DataKey::RouteConfig(route.clone()))
             {
                 if config.failure_threshold > 0 {
-                    let mut cb_state: CircuitBreakerState = env
+                    let mut route_call_state: RouteCallState = env
                         .storage()
                         .instance()
-                        .get(&DataKey::CircuitBreaker(route.clone()))
-                        .unwrap_or(CircuitBreakerState {
-                            failure_count: 0,
-                            opened_at: 0,
-                            is_open: false,
+                        .get(&DataKey::RouteCallState(route.clone()))
+                        .unwrap_or(RouteCallState {
+                            rate_limits: Map::new(&env),
+                            circuit_breaker: CircuitBreakerState {
+                                failure_count: 0,
+                                opened_at: 0,
+                                is_open: false,
+                            },
                         });
 
-                    if !cb_state.is_open && cb_state.failure_count > 0 {
-                        cb_state.failure_count = 0;
+                    if !route_call_state.circuit_breaker.is_open
+                        && route_call_state.circuit_breaker.failure_count > 0
+                    {
+                        route_call_state.circuit_breaker.failure_count = 0;
                         env.storage()
                             .instance()
-                            .set(&DataKey::CircuitBreaker(route), &cb_state);
+                            .set(&DataKey::RouteCallState(route), &route_call_state);
                     }
                 }
             }
@@ -556,10 +614,27 @@ impl RouterMiddleware {
     /// # Returns
     /// A [`Vec<CallLogEntry>`] of call log entries.
     pub fn get_call_log(env: Env, route: String) -> Vec<CallLogEntry> {
-        env.storage()
+        let Some(log_state) = env
+            .storage()
             .instance()
-            .get(&DataKey::CallLog(route))
-            .unwrap_or(Vec::new(&env))
+            .get::<DataKey, CallLogState>(&DataKey::CallLog(route))
+        else {
+            return Vec::new(&env);
+        };
+
+        if log_state.entries.is_empty() || log_state.head == 0 {
+            return log_state.entries;
+        }
+
+        let len = log_state.entries.len();
+        let mut ordered = Vec::new(&env);
+        for i in 0..len {
+            let idx = (log_state.head + i) % len;
+            if let Some(entry) = log_state.entries.get(idx) {
+                ordered.push_back(entry);
+            }
+        }
+        ordered
     }
 
     /// Get the number of call log entries for a route.
@@ -579,9 +654,27 @@ impl RouterMiddleware {
     pub fn get_call_log_length(env: Env, route: String) -> u32 {
         env.storage()
             .instance()
-            .get::<DataKey, Vec<CallLogEntry>>(&DataKey::CallLog(route))
-            .map(|log| log.len())
+            .get::<DataKey, CallLogState>(&DataKey::CallLog(route))
+            .map(|log| log.entries.len())
             .unwrap_or(0)
+    }
+
+    /// Get an aggregated summary of call log stats for a route.
+    ///
+    /// Returns total calls, success count, failure count, and last call timestamp
+    /// without loading all log entries. The summary is maintained incrementally
+    /// by `post_call` whenever log retention is enabled for the route.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `route` - The route name to summarize.
+    ///
+    /// # Returns
+    /// `Some(CallLogSummary)` if any calls have been logged, `None` otherwise.
+    pub fn get_call_log_summary(env: Env, route: String) -> Option<CallLogSummary> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CallLogSummary(route))
     }
 
     /// Clear all call log entries for a route.
@@ -632,10 +725,11 @@ impl RouterMiddleware {
     /// `Some(`[`RateLimitState`]`)` if the caller has made at least one call on this route,
     /// `None` otherwise.
     pub fn rate_limit_state(env: Env, route: String, caller: Address) -> Option<RateLimitState> {
-        let state: RateLimitState = env
+        let route_call_state: RouteCallState = env
             .storage()
             .instance()
-            .get(&DataKey::RateLimit(route.clone(), caller))?;
+            .get(&DataKey::RouteCallState(route.clone()))?;
+        let state: RateLimitState = route_call_state.rate_limits.get(caller)?;
 
         // If route config exists, apply window expiry logic
         if let Some(config) = env
@@ -699,9 +793,11 @@ impl RouterMiddleware {
     /// # Returns
     /// `Some(CircuitBreakerState)` if state exists, `None` otherwise.
     pub fn circuit_breaker_state(env: Env, route: String) -> Option<CircuitBreakerState> {
-        env.storage()
+        let route_call_state: RouteCallState = env
+            .storage()
             .instance()
-            .get(&DataKey::CircuitBreaker(route))
+            .get(&DataKey::RouteCallState(route))?;
+        Some(route_call_state.circuit_breaker)
     }
 
     /// Get current admin.
@@ -754,9 +850,22 @@ impl RouterMiddleware {
             opened_at: 0,
             is_open: false,
         };
+        let mut route_call_state: RouteCallState = env
+            .storage()
+            .instance()
+            .get(&DataKey::RouteCallState(route.clone()))
+            .unwrap_or(RouteCallState {
+                rate_limits: Map::new(&env),
+                circuit_breaker: CircuitBreakerState {
+                    failure_count: 0,
+                    opened_at: 0,
+                    is_open: false,
+                },
+            });
+        route_call_state.circuit_breaker = reset_state;
         env.storage()
             .instance()
-            .set(&DataKey::CircuitBreaker(route), &reset_state);
+            .set(&DataKey::RouteCallState(route), &route_call_state);
         Ok(())
     }
 
@@ -1491,4 +1600,63 @@ mod tests {
         let emitted: bool = last.2.into_val(&env);
         assert!(!emitted);
     }
-}
+
+    // ── Issue #449: get_call_log_summary ─────────────────────────────────────
+
+    #[test]
+    fn test_get_call_log_summary_none_before_calls() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &5);
+        assert_eq!(client.get_call_log_summary(&route), None);
+    }
+
+    #[test]
+    fn test_get_call_log_summary_counts_correctly() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        let caller = Address::generate(&env);
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &10);
+
+        client.post_call(&caller, &route, &true);
+        client.post_call(&caller, &route, &true);
+        client.post_call(&caller, &route, &false);
+
+        let summary = client.get_call_log_summary(&route).unwrap();
+        assert_eq!(summary.total_calls, 3);
+        assert_eq!(summary.success_count, 2);
+        assert_eq!(summary.failure_count, 1);
+    }
+
+    #[test]
+    fn test_get_call_log_summary_last_call_timestamp() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        let caller = Address::generate(&env);
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &10);
+
+        env.ledger().set_timestamp(1000);
+        client.post_call(&caller, &route, &true);
+        env.ledger().set_timestamp(2000);
+        client.post_call(&caller, &route, &false);
+
+        let summary = client.get_call_log_summary(&route).unwrap();
+        assert_eq!(summary.last_call_timestamp, 2000);
+    }
+
+    #[test]
+    fn test_get_call_log_summary_not_affected_by_retention_limit() {
+        // Summary counts all calls ever, even when the log is capped by retention
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        let caller = Address::generate(&env);
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &2); // retain only 2
+
+        for _ in 0..5 {
+            client.post_call(&caller, &route, &true);
+        }
+
+        let summary = client.get_call_log_summary(&route).unwrap();
+        assert_eq!(summary.total_calls, 5); // all 5 counted
+        assert_eq!(client.get_call_log(&route).len(), 2); // only 2 retained
+    }

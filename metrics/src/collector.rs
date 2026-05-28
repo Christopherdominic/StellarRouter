@@ -489,7 +489,11 @@ fn extract_circuit_breaker_state(val: &serde_json::Value) -> Option<(bool, u32)>
         .unwrap_or(0) as u32;
 
     Some((is_open, failure_count))
-=======
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
     use serde_json::json;
 
     #[test]

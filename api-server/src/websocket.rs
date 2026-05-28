@@ -6,6 +6,7 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
+use futures_util::stream::FuturesUnordered;
 use serde_json::json;
 use tracing::{error, info, warn};
 
@@ -14,6 +15,7 @@ use crate::{
     types::{SubscribeMessage, TransactionStatusEvent},
 };
 
+/// WebSocket upgrade handler
 pub async fn ws_handler(
     State(state): State<AppState>,
     ws: WebSocketUpgrade,
@@ -40,35 +42,52 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     info!("Client subscribed to tx_id: {}", sub_msg.tx_id);
                                     subscriptions.push(sub_msg.tx_id.clone());
                                     state.add_subscriber(sub_msg.tx_id.clone());
-                                    rx_handles.push((sub_msg.tx_id.clone(), state.tx_status_tx.subscribe()));
+                                    let rx = state.tx_status_tx.subscribe();
+                                    rx_handles.push((sub_msg.tx_id.clone(), rx));
+
                                     let response = json!({
                                         "msg_type": "subscribed",
-                                        "data": { "tx_id": sub_msg.tx_id, "status": "subscribed" }
+                                        "data": {
+                                            "tx_id": sub_msg.tx_id,
+                                            "status": "subscribed",
+                                        },
                                     });
-                                    if sender.send(Message::Text(response.to_string())).await.is_err() {
+
+                                    if let Err(e) = sender.send(Message::Text(response.to_string())).await {
+                                        error!("Failed to send subscription confirmation: {}", e);
                                         break;
                                     }
                                 } else if sub_msg.action == "unsubscribe" {
+                                    info!("Client unsubscribed from tx_id: {}", sub_msg.tx_id);
                                     subscriptions.retain(|id| id != &sub_msg.tx_id);
                                     state.remove_subscriber(&sub_msg.tx_id);
                                     rx_handles.retain(|(id, _)| id != &sub_msg.tx_id);
                                 }
                             }
-                            Err(e) => warn!("Failed to parse WebSocket message: {}", e),
+                            Err(e) => {
+                                warn!("Failed to parse WebSocket message: {}", e);
+                            }
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         info!("WebSocket client disconnected");
-                        for tx_id in &subscriptions { state.remove_subscriber(tx_id); }
+                        for tx_id in &subscriptions {
+                            state.remove_subscriber(tx_id);
+                        }
                         break;
                     }
-                    Some(Err(e)) => { error!("WebSocket error: {}", e); break; }
+                    Some(Err(e)) => {
+                        error!("WebSocket error: {}", e);
+                        break;
+                    }
                     _ => {}
                 }
             }
             result = async {
                 for (tx_id, rx) in &mut rx_handles {
-                    if let Ok(event) = rx.try_recv() { return Some((tx_id.clone(), event)); }
+                    if let Ok(event) = rx.try_recv() {
+                        return Some((tx_id.clone(), event));
+                    }
                 }
                 if let Some((tx_id, rx)) = rx_handles.first_mut() {
                     match rx.recv().await {
@@ -86,10 +105,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             "tx_id": event.tx_id,
                             "status": event.status,
                             "timestamp": event.timestamp,
-                            "message": event.message
-                        }
+                            "message": event.message,
+                        },
                     });
-                    if sender.send(Message::Text(response.to_string())).await.is_err() {
+
+                    if let Err(e) = sender.send(Message::Text(response.to_string())).await {
+                        error!("Failed to send status update: {}", e);
                         break;
                     }
                 }
