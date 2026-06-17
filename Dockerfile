@@ -58,7 +58,11 @@ FROM builder AS metrics-builder
 RUN cargo build --release --package router-metrics-exporter
 
 FROM debian:bookworm-slim AS metrics
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
 COPY --from=metrics-builder /app/target/release/router-metrics-exporter /usr/local/bin/
 EXPOSE 9090
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:9090/health || exit 1
 ENTRYPOINT ["router-metrics-exporter"]
