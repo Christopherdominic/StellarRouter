@@ -1,15 +1,25 @@
 mod auth;
 mod handlers;
+mod openapi;
 mod rpc;
 mod state;
 mod types;
 mod websocket;
 
+
 #[cfg(test)]
 mod tests;
 
 use anyhow::{Context, Result};
-use axum::{extract::DefaultBodyLimit, middleware::from_fn_with_state, routing::{get, post}, Router};
+use axum::{
+    extract::DefaultBodyLimit,
+    middleware::from_fn_with_state,
+    routing::{get, post},
+    Router,
+};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
+
 use clap::Parser;
 use std::net::SocketAddr;
 use tracing::info;
@@ -70,10 +80,21 @@ async fn main() -> Result<()> {
         .route_layer(from_fn_with_state(auth_config, auth::auth_middleware));
 
     let app = Router::new()
+        .route(
+            "/api-docs/openapi.json",
+            get(|| async move { utoipa::openapi::OpenApi::to_json(&openapi::ApiDoc::openapi()) }),
+        )
+        .merge(
+            Router::new().nest(
+                "/swagger-ui",
+                SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi::ApiDoc::openapi()),
+            ),
+        )
         .route("/health", get(handlers::health))
         .nest("/", protected_routes)
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(state);
+
 
     let addr: SocketAddr = args
         .listen

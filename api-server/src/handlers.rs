@@ -15,11 +15,29 @@ use crate::{
     },
 };
 
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses(
+        (status = 200, description = "Health check response")
+    )
+)]
 /// GET /health
 pub async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({"status": "ok"})))
 }
 
+#[utoipa::path(
+    post,
+    path = "/simulate",
+    request_body = SimulateRequest,
+    responses(
+        (status = 200, description = "Simulation result", body = SimulateResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 503, description = "Service unavailable", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
 /// POST /simulate
 ///
 /// Calls the Soroban RPC `simulateTransaction` endpoint to get real fee
@@ -28,6 +46,7 @@ pub async fn simulate(
     State(state): State<AppState>,
     Json(req): Json<SimulateRequest>,
 ) -> Result<Json<SimulateResponse>, (StatusCode, Json<ErrorResponse>)> {
+
     if req.target.is_empty() || req.function.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -74,6 +93,18 @@ pub async fn simulate(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/routes/{name}",
+    params(
+        (name = "name", description = "Route name", location = "path", required = true, example = "example_route")
+    ),
+    responses(
+        (status = 200, description = "Route entry", body = RouteEntryResponse),
+        (status = 404, description = "Route not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
 /// GET /routes/:name
 ///
 /// Calls router-core::get_route(name) via the Soroban RPC and returns the
@@ -97,6 +128,15 @@ pub async fn get_route(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/routes",
+    responses(
+        (status = 200, description = "Routes list", body = serde_json::Value),
+        (status = 503, description = "Service unavailable", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
 /// GET /routes
 ///
 /// Calls `get_all_routes` on the router-core contract via Soroban RPC and
