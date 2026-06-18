@@ -1,17 +1,9 @@
-//! Replay attack protection middleware for the metrics exporter.
+//! Re-exports the shared replay-protection middleware from `router-off-chain-common`.
 //!
-//! Prevents duplicate or malicious repeated transaction submissions using nonce-based approach.
-//!
-//! Configuration via environment variables:
-//! - `ROUTER_REPLAY_PROTECTION_ENABLED` — Set to "true" to enable replay protection (default: false)
-//! - `ROUTER_NONCE_CACHE_SIZE` — Maximum number of nonces to cache (default: 10000)
-//! - `ROUTER_NONCE_TTL_SECS` — Time-to-live for nonces in seconds (default: 3600)
+//! See [`router_off_chain_common::replay_protection`] for full documentation.
 
-use axum::{
-    extract::Request,
-    http::{HeaderMap, StatusCode},
-    middleware::Next,
-    response::{IntoResponse, Response},
+pub use router_off_chain_common::replay_protection::{
+    replay_protection_middleware, NonceCache, ReplayProtectionConfig,
 };
 use dashmap::DashMap;
 use std::env;

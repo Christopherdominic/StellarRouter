@@ -1,13 +1,15 @@
-//! Re-exports the shared authentication middleware from `router-off-chain-common`.
+//! Request authentication middleware.
 //!
-//! See [`router_off_chain_common::auth`] for full documentation.
 //! Supports API key-based authentication via:
 //! - `Authorization: Bearer <api-key>` header
 //! - `X-API-Key: <api-key>` header
 //!
-//! Configuration via environment variables:
-//! - `ROUTER_API_KEY` — API key for authentication (if not set, authentication is disabled)
-//! - `ROUTER_AUTH_ENABLED` — Set to "true" to enable authentication (default: false)
+//! ## Configuration (environment variables)
+//!
+//! | Variable | Default | Description |
+//! |----------|---------|-------------|
+//! | `ROUTER_API_KEY` | — | API key for authentication. If unset, authentication is disabled. |
+//! | `ROUTER_AUTH_ENABLED` | `false` | Set to `"true"` to require authentication. |
 
 use axum::{
     extract::Request,
@@ -21,14 +23,18 @@ use tracing::warn;
 /// Authentication configuration.
 #[derive(Clone, Debug)]
 pub struct AuthConfig {
-    /// API key for authentication. If None, authentication is disabled.
+    /// API key for authentication. `None` means authentication is disabled.
     pub api_key: Option<String>,
-    /// Whether authentication is enabled.
+    /// Whether authentication is enforced.
     pub enabled: bool,
 }
 
 impl AuthConfig {
     /// Load authentication configuration from environment variables.
+    ///
+    /// Authentication is only active when **both** `ROUTER_AUTH_ENABLED=true` and
+    /// `ROUTER_API_KEY` is set. If auth is enabled but no key is configured a
+    /// warning is emitted and authentication is silently disabled.
     pub fn from_env() -> Self {
         let enabled = env::var("ROUTER_AUTH_ENABLED")
             .map(|v| v.to_lowercase() == "true")
@@ -37,7 +43,10 @@ impl AuthConfig {
         let api_key = env::var("ROUTER_API_KEY").ok();
 
         if enabled && api_key.is_none() {
-            warn!("Authentication enabled but ROUTER_API_KEY not set. Authentication will be disabled.");
+            warn!(
+                "Authentication enabled but ROUTER_API_KEY not set. \
+                 Authentication will be disabled."
+            );
         }
 
         AuthConfig {
@@ -47,19 +56,17 @@ impl AuthConfig {
     }
 }
 
-use axum::{
-    extract::State,
-};
-
-/// Authentication middleware that validates API keys.
+/// Axum middleware that validates API keys.
+///
+/// When authentication is disabled (`config.enabled == false`) all requests
+/// pass through unchanged.
 pub async fn auth_middleware(
-    State(config): State<AuthConfig>,
+    axum::extract::State(config): axum::extract::State<AuthConfig>,
     req: Request,
     next: Next,
-) -> Response {
-    // Skip authentication if disabled
+) -> Result<Response, AuthError> {
     if !config.enabled {
-        return next.run(req).await;
+        return Ok(next.run(req).await);
     }
 
     let headers = req.headers();
@@ -69,19 +76,21 @@ pub async fn auth_middleware(
         Some(key) => {
             if let Some(expected_key) = &config.api_key {
                 if key == *expected_key {
-                    next.run(req).await
+                    Ok(next.run(req).await)
                 } else {
-                    AuthError::InvalidKey.into_response()
+                    Err(AuthError::InvalidKey)
                 }
             } else {
-                AuthError::Unauthorized.into_response()
+                Err(AuthError::Unauthorized)
             }
         }
-        None => AuthError::MissingKey.into_response(),
+        None => Err(AuthError::MissingKey),
     }
 }
 
-/// Extract API key from request headers.
+/// Extract the API key from request headers.
+///
+/// Checks `Authorization: Bearer <key>` first, then `X-API-Key: <key>`.
 fn extract_api_key(headers: &HeaderMap) -> Option<String> {
     // Try Authorization: Bearer <key>
     if let Some(auth_header) = headers.get("authorization") {
@@ -102,14 +111,14 @@ fn extract_api_key(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Authentication errors.
+/// Authentication errors returned by [`auth_middleware`].
 #[derive(Debug)]
 pub enum AuthError {
-    /// Missing API key in request.
+    /// No API key was included in the request.
     MissingKey,
-    /// Invalid API key provided.
+    /// An API key was included but it did not match the expected value.
     InvalidKey,
-    /// Unauthorized access.
+    /// Catch-all unauthorised error (e.g. auth enabled but no key configured).
     Unauthorized,
 }
 
@@ -120,7 +129,6 @@ impl IntoResponse for AuthError {
             AuthError::InvalidKey => (StatusCode::UNAUTHORIZED, "Invalid API key"),
             AuthError::Unauthorized => (StatusCode::FORBIDDEN, "Unauthorized"),
         };
-
         (status, message).into_response()
     }
 }
@@ -128,30 +136,26 @@ impl IntoResponse for AuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderMap;
 
     #[test]
     fn test_extract_bearer_token() {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-key-123".parse().unwrap());
-
-        let key = extract_api_key(&headers);
-        assert_eq!(key, Some("test-key-123".to_string()));
+        assert_eq!(extract_api_key(&headers), Some("test-key-123".to_string()));
     }
 
     #[test]
     fn test_extract_api_key_header() {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", "test-key-456".parse().unwrap());
-
-        let key = extract_api_key(&headers);
-        assert_eq!(key, Some("test-key-456".to_string()));
+        assert_eq!(extract_api_key(&headers), Some("test-key-456".to_string()));
     }
 
     #[test]
     fn test_extract_api_key_missing() {
         let headers = HeaderMap::new();
-        let key = extract_api_key(&headers);
-        assert_eq!(key, None);
+        assert_eq!(extract_api_key(&headers), None);
     }
 
     #[test]
@@ -159,5 +163,6 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer bearer-key".parse().unwrap());
         headers.insert("x-api-key", "api-key".parse().unwrap());
-
-pub use router_off_chain_common::auth::{auth_middleware, AuthConfig};
+        assert_eq!(extract_api_key(&headers), Some("bearer-key".to_string()));
+    }
+}
