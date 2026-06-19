@@ -278,6 +278,46 @@ impl Collector {
             }
         }
 
+        // 3. Per-route call/failure counts from post_call events
+        let start_ledger = {
+            let map = self.last_ledger.lock().await;
+            map.get(&format!("middleware:{contract_id}")).copied().unwrap_or(0)
+        };
+
+        let post_call_events = client
+            .get_events(contract_id, &["post_call"], start_ledger)
+            .await?;
+
+        // Advance cursor to the highest ledger seen
+        let max_ledger = post_call_events
+            .iter()
+            .map(|e| e.ledger)
+            .max()
+            .unwrap_or(start_ledger);
+
+        // Process events: extract route and success, increment counters
+        for event in &post_call_events {
+            if let Some((route, success)) = extract_post_call_data(event) {
+                self.metrics
+                    .middleware_route_calls_total
+                    .with_label_values(&[contract_id, &route])
+                    .inc();
+                if !success {
+                    self.metrics
+                        .middleware_route_failures_total
+                        .with_label_values(&[contract_id, &route])
+                        .inc();
+                }
+            }
+        }
+
+        if max_ledger > start_ledger {
+            self.last_ledger
+                .lock()
+                .await
+                .insert(format!("middleware:{contract_id}"), max_ledger);
+        }
+
         let elapsed = start.elapsed().as_secs_f64();
         self.metrics
             .scrape_duration_seconds
@@ -289,6 +329,9 @@ impl Collector {
             elapsed_secs = elapsed,
             routes = routes.len(),
             total_calls,
+            post_call_events = post_call_events.len(),
+            start_ledger,
+            max_ledger,
             "middleware scrape done"
         );
         Ok(())
@@ -375,15 +418,11 @@ impl Collector {
         let g_quote = self.metrics.quote_total_generated.with_label_values(&[contract_id]);
         let g_fee = self.metrics.quote_total_fee_estimated.with_label_values(&[contract_id]);
 
-        if start_ledger == 0 {
-            // Baseline: set absolute counts from the full retention window.
-            g_quote.set(quote_count);
-            g_fee.set(fee_count);
-        } else {
-            // Incremental: add only the newly-observed events.
-            g_quote.inc_by(quote_count);
-            g_fee.inc_by(fee_count);
-        }
+        // Counters can only be incremented, never set.
+        // On first scrape (cursor=0), we increment by all events in the retention window.
+        // On subsequent scrapes, we increment by only new events.
+        g_quote.inc_by(quote_count);
+        g_fee.inc_by(fee_count);
 
         if max_ledger > start_ledger {
             self.last_ledger
@@ -463,13 +502,11 @@ impl Collector {
         let g_exec = self.metrics.execution_total_executions.with_label_values(&[contract_id]);
         let g_err = self.metrics.execution_total_errors.with_label_values(&[contract_id]);
 
-        if start_ledger == 0 {
-            g_exec.set(exec_count);
-            g_err.set(err_count);
-        } else {
-            g_exec.inc_by(exec_count);
-            g_err.inc_by(err_count);
-        }
+        // Counters can only be incremented, never set.
+        // On first scrape (cursor=0), we increment by all events in the retention window.
+        // On subsequent scrapes, we increment by only new events.
+        g_exec.inc_by(exec_count);
+        g_err.inc_by(err_count);
 
         self.metrics
             .execution_max_retries
@@ -970,6 +1007,146 @@ mod tests {
         assert_eq!(extract_circuit_breaker_state(&val), Some((false, 2)));
     }
 
+    #[test]
+    fn test_extract_post_call_data_success() {
+        use crate::rpc::ContractEvent;
+        let event = ContractEvent {
+            contract_id: "MW_ID".to_string(),
+            ledger: 100,
+            topic: vec![serde_json::json!("post_call")],
+            value: json!({ "route": "oracle", "success": true }),
+        };
+        assert_eq!(extract_post_call_data(&event), Some(("oracle".to_string(), true)));
+    }
+
+    #[test]
+    fn test_extract_post_call_data_failure() {
+        use crate::rpc::ContractEvent;
+        let event = ContractEvent {
+            contract_id: "MW_ID".to_string(),
+            ledger: 101,
+            topic: vec![serde_json::json!("post_call")],
+            value: json!({ "route": "vault", "success": false }),
+        };
+        assert_eq!(extract_post_call_data(&event), Some(("vault".to_string(), false)));
+    }
+
+    #[test]
+    fn test_extract_post_call_data_nested() {
+        use crate::rpc::ContractEvent;
+        let event = ContractEvent {
+            contract_id: "MW_ID".to_string(),
+            ledger: 102,
+            topic: vec![serde_json::json!("post_call")],
+            value: json!({
+                "value": ["caller_address", "oracle", true]
+            }),
+        };
+        assert_eq!(extract_post_call_data(&event), Some(("oracle".to_string(), true)));
+    }
+
+    #[test]
+    fn test_extract_post_call_data_invalid() {
+        use crate::rpc::ContractEvent;
+        let event = ContractEvent {
+            contract_id: "MW_ID".to_string(),
+            ledger: 103,
+            topic: vec![serde_json::json!("post_call")],
+            value: json!({ "invalid": "data" }),
+        };
+        assert_eq!(extract_post_call_data(&event), None);
+    }
+
+    #[tokio::test]
+    async fn test_scrape_middleware_with_post_call_events() {
+        use crate::rpc::ContractEvent;
+        let (collector, metrics) = make_collector("", "MW_ID", "");
+
+        let make_event = |route: &str, success: bool, ledger: u32| ContractEvent {
+            contract_id: "MW_ID".to_string(),
+            ledger,
+            topic: vec![serde_json::json!("post_call")],
+            value: json!({ "route": route, "success": success }),
+        };
+
+        let mock = MockRpcClient::new()
+            .with_u64("MW_ID", "total_calls", 10)
+            .with_string_vec("MW_ID", "get_configured_routes", vec!["oracle".to_string()])
+            .with_events("MW_ID", "post_call", vec![
+                make_event("oracle", true, 100),
+                make_event("oracle", true, 101),
+                make_event("oracle", false, 102),
+            ]);
+
+        let ok = collector.scrape_all(&mock).await;
+        assert!(ok);
+
+        // Check that per-route counters were incremented
+        assert_eq!(
+            metrics
+                .middleware_route_calls_total
+                .with_label_values(&["MW_ID", "oracle"])
+                .get(),
+            3.0
+        );
+        assert_eq!(
+            metrics
+                .middleware_route_failures_total
+                .with_label_values(&["MW_ID", "oracle"])
+                .get(),
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scrape_middleware_post_call_increments_on_second_scrape() {
+        use crate::rpc::ContractEvent;
+        let (collector, metrics) = make_collector("", "MW_ID", "");
+
+        let make_event = |route: &str, success: bool, ledger: u32| ContractEvent {
+            contract_id: "MW_ID".to_string(),
+            ledger,
+            topic: vec![serde_json::json!("post_call")],
+            value: json!({ "route": route, "success": success }),
+        };
+
+        // First scrape: 2 events
+        let mock1 = MockRpcClient::new()
+            .with_u64("MW_ID", "total_calls", 5)
+            .with_string_vec("MW_ID", "get_configured_routes", vec!["oracle".to_string()])
+            .with_events("MW_ID", "post_call", vec![
+                make_event("oracle", true, 100),
+                make_event("oracle", false, 101),
+            ]);
+        collector.scrape_all(&mock1).await;
+
+        // Second scrape: 1 new event
+        let mock2 = MockRpcClient::new()
+            .with_u64("MW_ID", "total_calls", 6)
+            .with_string_vec("MW_ID", "get_configured_routes", vec!["oracle".to_string()])
+            .with_events("MW_ID", "post_call", vec![
+                make_event("oracle", true, 102),
+            ]);
+        let ok = collector.scrape_all(&mock2).await;
+        assert!(ok);
+
+        // Counters should be 2 (first scrape) + 1 (second scrape) = 3 total calls, 1 failure
+        assert_eq!(
+            metrics
+                .middleware_route_calls_total
+                .with_label_values(&["MW_ID", "oracle"])
+                .get(),
+            3.0
+        );
+        assert_eq!(
+            metrics
+                .middleware_route_failures_total
+                .with_label_values(&["MW_ID", "oracle"])
+                .get(),
+            1.0
+        );
+    }
+
 }
 
 
@@ -1023,5 +1200,44 @@ fn extract_circuit_breaker_state(val: &serde_json::Value) -> Option<(bool, u32)>
         .unwrap_or(0) as u32;
 
     Some((is_open, failure_count))
+}
+
+/// Extract `(route, success)` from a `post_call` event value.
+///
+/// Event schema: { caller: Address, route: String, success: bool }
+fn extract_post_call_data(event: &crate::rpc::ContractEvent) -> Option<(String, bool)> {
+    // The event value contains the post_call data as a JSON object
+    let value = &event.value;
+    
+    // Try to extract route and success from the value
+    // The value may be directly the struct or wrapped in an array/object
+    let route = value
+        .get("route")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            // Try nested path: value.value[1] for route (index 1 in array)
+            value.get("value")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.get(1))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
+    
+    let success = value
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .or_else(|| {
+            // Try nested path: value.value[2] for success (index 2 in array)
+            value.get("value")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.get(2))
+                .and_then(|v| v.as_bool())
+        });
+    
+    match (route, success) {
+        (Some(r), Some(s)) => Some((r, s)),
+        _ => None,
+    }
 }
 
