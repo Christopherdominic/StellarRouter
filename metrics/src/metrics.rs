@@ -36,6 +36,12 @@ pub struct RouterMetrics {
     /// Cumulative number of `pre_call` invocations since contract init.
     pub middleware_total_calls: GaugeVec,
 
+    /// Cumulative number of calls per route (from post_call events).
+    pub middleware_route_calls_total: CounterVec,
+
+    /// Cumulative number of failures per route (from post_call events).
+    pub middleware_route_failures_total: CounterVec,
+
     /// 1 if the circuit breaker for a route is currently open, 0 otherwise.
     pub middleware_circuit_open: GaugeVec,
 
@@ -51,17 +57,17 @@ pub struct RouterMetrics {
 
     // ── router-quote ──────────────────────────────────────────────────────────
     /// Running total of `quote_generated` events observed.
-    pub quote_total_generated: GaugeVec,
+    pub quote_total_generated: CounterVec,
 
     /// Running total of `fee_estimated` events observed.
-    pub quote_total_fee_estimated: GaugeVec,
+    pub quote_total_fee_estimated: CounterVec,
 
     // ── router-execution ──────────────────────────────────────────────────────
     /// Cumulative number of executions recorded in on-chain storage.
-    pub execution_total_executions: GaugeVec,
+    pub execution_total_executions: CounterVec,
 
     /// Cumulative number of execution errors recorded in on-chain storage.
-    pub execution_total_errors: GaugeVec,
+    pub execution_total_errors: CounterVec,
 
     /// Configured maximum retries read from on-chain storage.
     pub execution_max_retries: GaugeVec,
@@ -108,6 +114,20 @@ impl RouterMetrics {
             registry
         )?;
 
+        let middleware_route_calls_total = register_counter_vec_with_registry!(
+            "router_middleware_route_calls_total",
+            "Cumulative number of calls per route from post_call events",
+            &["contract", "route"],
+            registry
+        )?;
+
+        let middleware_route_failures_total = register_counter_vec_with_registry!(
+            "router_middleware_route_failures_total",
+            "Cumulative number of failures per route from post_call events",
+            &["contract", "route"],
+            registry
+        )?;
+
         let middleware_circuit_open = register_gauge_vec_with_registry!(
             "router_middleware_circuit_open",
             "1 if the circuit breaker for a route is currently open, 0 otherwise",
@@ -136,28 +156,28 @@ impl RouterMetrics {
             registry
         )?;
 
-        let quote_total_generated = register_gauge_vec_with_registry!(
+        let quote_total_generated = register_counter_vec_with_registry!(
             "router_quote_total_generated",
             "Running total of quote_generated events observed from router-quote",
             &["contract"],
             registry
         )?;
 
-        let quote_total_fee_estimated = register_gauge_vec_with_registry!(
+        let quote_total_fee_estimated = register_counter_vec_with_registry!(
             "router_quote_total_fee_estimated",
             "Running total of fee_estimated events observed from router-quote",
             &["contract"],
             registry
         )?;
 
-        let execution_total_executions = register_gauge_vec_with_registry!(
+        let execution_total_executions = register_counter_vec_with_registry!(
             "router_execution_total_executions",
             "Cumulative number of executions recorded in router-execution on-chain storage",
             &["contract"],
             registry
         )?;
 
-        let execution_total_errors = register_gauge_vec_with_registry!(
+        let execution_total_errors = register_counter_vec_with_registry!(
             "router_execution_total_errors",
             "Cumulative number of execution errors recorded in router-execution on-chain storage",
             &["contract"],
@@ -197,6 +217,8 @@ impl RouterMetrics {
             core_paused,
             core_route_paused,
             middleware_total_calls,
+            middleware_route_calls_total,
+            middleware_route_failures_total,
             middleware_circuit_open,
             middleware_failure_count,
             registry_total_names,
